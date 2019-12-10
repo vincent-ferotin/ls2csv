@@ -65,7 +65,7 @@ LSD = "ls -A -l -Q -Z --time-style=long-iso -d \"{path}\""
 LS_OUTPUT_REGEX = compile_(''
     r'^'
     # Type
-    r'(?P<p_type>d|r|-)'
+    r'(?P<p_type>l|d|r|-)'
     # Permissions
     r'(?P<p_perms>((r|-)(w|-)(x|X|s|t|S|T|-)){3})'
     r'\s+'
@@ -174,6 +174,8 @@ class OwnerType(Enum):
 
 
 class NodeInfos:
+    """Metadata about a filesystem node.
+    """
     def __init__(self, path, type_,
                  links_nb=None, size=None,
                  perms=None, user_owner=None, group_owner=None, security=None,
@@ -183,6 +185,8 @@ class NodeInfos:
         self._path = Path(path) if isinstance(path, str) else path
         self._type = type_
         self._links_nb = links_nb
+        if isinstance(size, int):
+            size = Size(size)
         self._size = size
         self._perms = perms
         self._user_owner = user_owner
@@ -218,7 +222,7 @@ class NodeInfos:
         return self._links_nb
 
     @property
-    def size(self):  # TODO: params: unit, human
+    def size(self):
         return self._size
 
     @property
@@ -279,7 +283,7 @@ class NodeInfos:
             "Type",
             "Links nb.",
             "Size (b)",
-            #"Size (H)",
+            "Size (-h)",
             "Permissions",
             "User owner",
             "Group owner",
@@ -297,7 +301,8 @@ class NodeInfos:
             self.path,
             self.type,
             self.links_nb,
-            self.size,
+            self.size.value,
+            self.size.convert_to(),
             self.perms,
             self.user_owner,
             self.group_owner,
@@ -314,6 +319,76 @@ class NodeInfos:
 FileContent = namedtuple('FileContent', (
     'content',
     'error_msg'))
+
+
+class Size:
+    """Size of a filesystem node.
+    """
+    UNITS = ['b', 'Kb', 'Mb', 'Gb', 'Tb']
+
+    def __init__(self, value, unit=None):
+        """Initialize a new size.
+
+        Arguments
+        ---------
+        value : `int`
+            Size of a node. If no :param:`unit` is set, assume it is in bytes.
+        size : `str`
+            Unit of bytes in which :param:`size` is expressed, one of `.UNITS`.
+            If not set, will default to ``'b'``.
+        """
+        self._value = value
+        unit = self.UNITS[0] if (unit is None) else unit
+        if unit not in self.UNITS:
+            error_msg = (""
+                f"Unit of size must belong to `Size.UNITS`, and be one of "
+                f"``{self.UNITS}``; parameter was set to ``'{unit}'``!")
+            raise ValueError(error_msg)
+        self._unit = unit
+
+    @property
+    def value(self):
+        return self._value
+
+    @property
+    def unit(self):
+        return self._unit
+
+    def convert_to(self, unit=None):
+        """Convert a given size in bytes into either human or in a given unit.
+
+        Arguments
+        ---------
+        unit : `str`
+            One of `.UNITS`.
+            If set to ``None`` (default), try to operate a conversion like
+            a human  would do.
+
+        Returns
+        -------
+        `str`
+            Size object representation into :param:`unit` unit.
+        """
+        if unit not in (self.UNITS[:] + [None]):
+            error_msg = (""
+                f"Unit of size must belong to `Size.UNITS`, and be one of "
+                f"``{self.UNITS}``; parameter was set to ``'{unit}'``!")
+            raise ValueError(error_msg)
+
+        divisor = 1024
+
+        if (unit == self.unit) or \
+                ((unit is None) and (self.unit == 'b') and (self.value < divisor)):
+            return f"{self.value} {self.unit}"
+
+        dividend = self.value
+        for exp, _unit in enumerate(self.UNITS[1:], start=1):
+            _size = float(dividend) / float(divisor)
+            if (_unit == self.unit) or ((unit is None) and (_size < divisor)):
+                return f"{_size:.1f} {_unit}"
+            dividend = _size
+
+        return f"{_size:.1f} {_unit}"
 
 
 # Functions  ----------------------------------------------------------------
