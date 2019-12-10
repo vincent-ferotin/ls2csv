@@ -8,6 +8,7 @@ from enum import (
     Enum,
     unique,
 )
+from datetime import datetime
 from hashlib import md5
 from os import (
     fsdecode,
@@ -192,9 +193,24 @@ class NodeInfos:
         self._user_owner = user_owner
         self._group_owner = group_owner
         self._security = security
-        self._atime = atime
-        self._mtime = mtime
-        self._ctime = ctime
+        self._atime = None
+        if atime:
+            if isinstance(atime, float):
+                self._atime = datetime.fromtimestamp(atime)
+            elif isinstance(atime, datetime):
+                self._atime = atime
+        self._mtime = None
+        if mtime:
+            if isinstance(mtime, float):
+                self._mtime = datetime.fromtimestamp(mtime)
+            elif isinstance(mtime, datetime):
+                self._mtime = mtime
+        self._ctime = None
+        if ctime:
+            if isinstance(ctime, float):
+                self._ctime = datetime.fromtimestamp(ctime)
+            elif isinstance(ctime, datetime):
+                self._ctime = ctime
         self._symlink = symlink
         self._symlink_type = symlink_type
         self._md5sum = md5sum
@@ -242,16 +258,40 @@ class NodeInfos:
         return self._security
 
     @property
-    def mtime(self):  # TODO: param: format, TZ
+    def mtime(self):
         return self._mtime
 
     @property
-    def atime(self):  # TODO: param: format, TZ
+    def mtime_as_timestamp(self):
+        return None if (self._mtime is None) else self._mtime.timestamp()
+
+    @property
+    def mtime_as_isoformat(self):
+        return None if (self._mtime is None) else self._mtime.isoformat()
+
+    @property
+    def atime(self):
         return self._atime
 
     @property
-    def ctime(self):  # TODO: param: format, TZ
+    def atime_as_timestamp(self):
+        return None if (self._atime is None) else self._atime.timestamp()
+
+    @property
+    def atime_as_isoformat(self):
+        return None if (self._atime is None) else self._atime.isoformat()
+
+    @property
+    def ctime(self):
         return self._ctime
+
+    @property
+    def ctime_as_timestamp(self):
+        return None if (self._ctime is None) else self._ctime.timestamp()
+
+    @property
+    def ctime_as_isoformat(self):
+        return None if (self._ctime is None) else self._ctime.isoformat()
 
     @property
     def symlink(self):
@@ -289,8 +329,11 @@ class NodeInfos:
             "Group owner",
             "Security infos.",
             "atime (last access, in s. since Epoch)",
+            "atime (ISO 8601 format)",
             "mtime (last mod., in s. since Epoch)",
+            "atime (ISO 8601 format)",
             "ctime (last metada change, in s. since Epoch)",
+            "ctime (ISO 8601 format)",
             "Sym.Link to path",
             "Type of Sym.Link",
             "Error message(s)",
@@ -307,9 +350,12 @@ class NodeInfos:
             self.user_owner,
             self.group_owner,
             self.security,
-            self.atime,
-            self.mtime,
-            self.ctime,
+            self.atime_as_timestamp,
+            self.atime_as_isoformat,
+            self.mtime_as_timestamp,
+            self.mtime_as_isoformat,
+            self.ctime_as_timestamp,
+            self.ctime_as_isoformat,
             self.symlink,
             self.symlink_type,
             self.error_msgs,
