@@ -211,7 +211,7 @@ class NodeInfos:
                 self._ctime = datetime.fromtimestamp(ctime)
             elif isinstance(ctime, datetime):
                 self._ctime = ctime
-        self._symlink = symlink
+        self._symlink = Path(symlink) if isinstance(symlink, str) else symlink
         self._symlink_type = symlink_type
         self._md5sum = md5sum
 
@@ -223,11 +223,24 @@ class NodeInfos:
                 self._error_msgs.extend([msg for msg in error_msgs])
 
     @property
-    def path(self, relative_to=None):
-        if relative_to:
-            return str(self._path.relative_to(relative_to))
+    def path(self):
+        if self._path is None:
+            return None
         # else:
         return str(self._path)
+
+    def get_path(self, relative_to=None):
+        if self._path is None:
+            return None
+        # else:
+        if relative_to is None:
+            return self.path
+        # else:
+        try:
+            _path = self._path.relative_to(relative_to)
+        except ValueError as error:
+            _path = self._path
+        return str(_path)
 
     @property
     def type(self):
@@ -295,7 +308,23 @@ class NodeInfos:
 
     @property
     def symlink(self):
-        return self._symlink
+        if self._symlink is None:
+            return None
+        # else:
+        return str(self._symlink)
+
+    def get_symlink(self, relative_to=None):
+        if self._symlink is None:
+            return None
+        # else:
+        if relative_to is None:
+            return self.symlink
+        # else:
+        try:
+            _symlink = self._symlink.relative_to(relative_to)
+        except ValueError as error:
+            _symlink = self._symlink
+        return str(_symlink)
 
     @property
     def symlink_type(self):
@@ -339,9 +368,9 @@ class NodeInfos:
             "Error message(s)",
         ])
 
-    def tocsv(self):
+    def tocsv(self, pathes_relative_to=None):
         return tocsv([
-            self.path,
+            self.get_path(relative_to=pathes_relative_to),
             self.type,
             self.links_nb,
             self.size.value,
@@ -356,7 +385,7 @@ class NodeInfos:
             self.mtime_as_isoformat,
             self.ctime_as_timestamp,
             self.ctime_as_isoformat,
-            self.symlink,
+            self.get_symlink(relative_to=pathes_relative_to),
             self.symlink_type,
             self.error_msgs,
         ])
@@ -797,6 +826,13 @@ def create_args_parser():
                         help=("Output CSV filepath where store results of "
                               "`ls` command traversing files tree. "
                               "If not set, `stdout` will be used instead."))
+    parser.add_argument('--pathes-relative-to',
+                        choices=['home', 'walked'],
+                        help=("Store walked pathes as relative to some other, "
+                              "either user's home or walked path. In each "
+                              "case, script will try to convert pathes if this "
+                              "is possible; else, or if option is not set, "
+                              "all pathes will be absolute."))
     parser.add_argument('path', nargs='?',
                         help="path to walk. Default to `.`.")
     return parser
@@ -869,6 +905,12 @@ def main():
         error_msg = f"Unable to reach ``{path}`` path to walk on it!"
         exit(error_msg)
 
+    #   nodes' pathes relative to
+    pathes_relative_to = None
+    if ('pathes_relative_to' in args) and (args.pathes_relative_to is not None):
+        pathes_relative_to = Path.home() if (args.pathes_relative_to == "home") \
+                                         else path_to_walk
+
     #   Manage output
     output_path = None if (('output' not in args) or (args.output is None)) \
                        else Path(args.output).resolve()
@@ -888,7 +930,8 @@ def main():
     # Walk tree and print dir. entries metadata:
     write_new_line(output_path, ENCODING, NodeInfos.colstocsv())
     for node_infos in _walk(str(path_to_walk), excluded, args.sleep):
-        write_new_line(output_path, ENCODING, node_infos.tocsv())
+        write_new_line(output_path, ENCODING,
+                       node_infos.tocsv(pathes_relative_to=pathes_relative_to))
 
     return 0
 
