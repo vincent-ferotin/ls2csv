@@ -537,6 +537,26 @@ class Options:
     def excluded_patterns(self):
         return [regex.pattern for regex in self._excluded]
 
+    def get_path(self, path):
+        """Get a filesystem path in a form respecting `pathes_relative_to`
+        setting.
+
+        Arguments
+        ---------
+        path : `pathlib.Path`
+            Path from which get value respecting application options.
+
+        Returns
+        -------
+        `pathlib.Path`
+            New path with same value that :param:`path`, following
+            `pathes_relative_to` setting.
+        """
+        if self._pathes_relative_to is None:
+            return Path(path)
+        # else:
+        return path.relative_to(self.pathes_relative_to)
+
 
 # Functions  ----------------------------------------------------------------
 
@@ -619,7 +639,7 @@ def match_none(path, regex_patterns):
 
     Arguments
     ---------
-    path : `str`
+    path : `pathlib.Path`
         Directory or file path to test again list of regexp patterns.
     regex_patterns : `iterable` of `re.regex`
         List of patterns to test :param:`path` against.
@@ -632,7 +652,7 @@ def match_none(path, regex_patterns):
         ``False`` otherwise (if any pattern match path).
     """
     for pattern in regex_patterns:
-        match = pattern.match(path)
+        match = pattern.match(str(path))
         if match:
             return False
     return True
@@ -875,10 +895,11 @@ def walk(path_to_walk, options):
         List of output of shell command `ls` on walked paths as constructed
         `Node` instances.
     """
-    LOGGER.info(f"  Start scanning `{path_to_walk}/` directory...")
+    LOGGER.info((f"  Start scanning `{options.get_path(path_to_walk)}/` "
+                 "directory..."))
     with scandir(path_to_walk) as dir_entries:
         for dir_entry in dir_entries:
-            _path = fsdecode(dir_entry.path)
+            _path = path_to_walk / fsdecode(dir_entry.path)
             if match_none(_path, options.excluded_regex):
                 node = get_node_infos(_path, dir_entry)
 
@@ -913,10 +934,10 @@ def create_args_parser():
                               "stored; if no value is set, a path derived from "
                               "value of `output` option will be used."))
     parser.add_argument('--pathes-relative-to',
-                        choices=['home', 'walked'],
-                        help=("Store walked pathes as relative to some other, "
-                              "either user's home or walked path. In each "
-                              "case, script will try to convert pathes if this "
+                        help=("Store walked pathes as relative to some other. "
+                              "Common options are ``<HOME>`` or ``<WALKED>``, "
+                              "for either user's home or walked path. "
+                              "Script will try to convert pathes if this "
                               "is possible; else, or if option is not set, "
                               "all pathes will be absolute."))
     parser.add_argument('path', nargs='?',
@@ -1042,9 +1063,16 @@ def prepare_options(this_script_path, working_dirpath, parsed_cli_args):
     pathes_relative_to = None
     if ('pathes_relative_to' in parsed_cli_args) \
             and (parsed_cli_args.pathes_relative_to is not None):
-        pathes_relative_to = \
-            Path.home() if (parsed_cli_args.pathes_relative_to == "home") \
-                        else path_to_walk
+        _pathes_relative_to = parsed_cli_args.pathes_relative_to
+        if _pathes_relative_to == "<HOME>":
+            pathes_relative_to = Path.home()
+        elif _pathes_relative_to == "<WALKED>":
+            pathes_relative_to = path_to_walk
+        else:
+            pathes_relative_to = Path(_pathes_relative_to).resolve()
+        if not pathes_relative_to.exists():
+            exit_on_error((f"Path, to which others will be relative to, "
+                           f"``{pathes_relative_to}`` seems to not exists!"))
 
     #   Manage output
     output_path = None if (('output' not in parsed_cli_args)
