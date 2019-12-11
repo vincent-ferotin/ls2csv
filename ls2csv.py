@@ -45,7 +45,7 @@ from sys import (
 
 # Constants  ----------------------------------------------------------------
 
-SCRIPT_DESC = "Custom version of `ls` outputin results in CSV format."
+SCRIPT_DESC = "Custom version of `ls` output in results in CSV format."
 
 # `ls` command and options:
 #
@@ -525,7 +525,7 @@ def write_new_line(filepath=None, encoding=None, content=None):
     #else:
 
     with open(filepath, mode='at', encoding=encoding) as file_:
-            file_.write(content + "\n")
+        file_.write(content + "\n")
 
 
 def match_none(path, regex_patterns):
