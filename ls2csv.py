@@ -10,6 +10,13 @@ from enum import (
 )
 from datetime import datetime
 from hashlib import md5
+from logging import (
+    FileHandler,
+    Formatter,
+    getLogger,
+    INFO,
+    StreamHandler,
+)
 from os import (
     fsdecode,
     getcwd,
@@ -39,13 +46,17 @@ from time import sleep
 from sys import (
     argv,
     exit,
-    stdout,
+    stderr,
 )
 
 
 # Constants  ----------------------------------------------------------------
 
 SCRIPT_DESC = "Custom version of `ls` output in results in CSV format."
+
+LOGGER = getLogger(__name__)
+
+DEFAULT_LOG_LEVEL = INFO
 
 # `ls` command and options:
 #
@@ -468,6 +479,20 @@ class Size:
 
 # Functions  ----------------------------------------------------------------
 
+def exit_on_error(msg, return_code=1):
+    """Exit system on error.
+
+    Arguments
+    ---------
+    msg : `str`
+        Error message to print to `sys.stderr`.
+    return_code : `int`
+        Return code.
+    """
+    print(msg, file=stderr)
+    exit(return_code)
+
+
 def tocsv(row):
     """Convert a list of values into a CSV row.
 
@@ -795,6 +820,7 @@ def _walk(path, excluded=None, sleep_time=DEFAULT_TIME_SLEEP):
     if excluded is None:
         excluded = []
 
+    LOGGER.info(f"  Start scanning `{path}/` directory...")
     with scandir(path) as dir_entries:
         for dir_entry in dir_entries:
             path = fsdecode(dir_entry.path)
@@ -826,6 +852,12 @@ def create_args_parser():
                         help=("Output CSV filepath where store results of "
                               "`ls` command traversing files tree. "
                               "If not set, `stdout` will be used instead."))
+    parser.add_argument('-l', '--log', nargs='?', const='<OUTPUT>.log',
+                        help=("Tell if a log file will be used in addition of "
+                              "`sys.stdout` (if option is used as a flag), "
+                              "and in which filepath log entries will be "
+                              "stored; if no value is set, a path derived from "
+                              "value of `output` option will be used."))
     parser.add_argument('--pathes-relative-to',
                         choices=['home', 'walked'],
                         help=("Store walked pathes as relative to some other, "
@@ -839,6 +871,45 @@ def create_args_parser():
 
 
 # Main  ---------------------------------------------------------------------
+
+def configure_logging(logfile_path=None, encoding=ENCODING,
+                      level=DEFAULT_LOG_LEVEL):
+    """Configure script logging behavior.
+
+    Arguments
+    ---------
+    logfile_path : `str`
+        Path of additional logfile, if any.
+    encoding : `str`
+        Encoding to use for additional logfile.
+    level : `int`
+        Minimum logging level for both logger and handlers.
+    """
+    # Create formatters
+    stderr_formatter = \
+        Formatter(fmt='%(asctime)s %(levelname)s: %(message)s',
+                  datefmt="%H:%M:%S")
+    if logfile_path:
+        logfile_formatter = \
+            Formatter(fmt='%(asctime)s - %(levelname)s - %(message)s',
+                      datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Create handlers
+    stderr_handler = StreamHandler(stream=stderr)
+    stderr_handler.setLevel(level)
+    stderr_handler.setFormatter(stderr_formatter)
+    if logfile_path:
+        logfile_handler = FileHandler(logfile_path, mode='ta',
+                                      encoding=encoding)
+        logfile_handler.setLevel(level)
+        logfile_handler.setFormatter(logfile_formatter)
+
+    # Configure main loader
+    LOGGER.addHandler(stderr_handler)
+    if logfile_path:
+        LOGGER.addHandler(logfile_handler)
+    LOGGER.setLevel(level)
+
 
 def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
     """Enhance path excluded list with current script name and optional
@@ -902,8 +973,7 @@ def main():
     try:
         path_to_walk = Path(path).resolve(strict=True)
     except FileNotFoundError as error:
-        error_msg = f"Unable to reach ``{path}`` path to walk on it!"
-        exit(error_msg)
+        exit_on_error(f"Unable to reach ``{path}`` path to walk on it!")
 
     #   nodes' pathes relative to
     pathes_relative_to = None
@@ -915,10 +985,25 @@ def main():
     output_path = None if (('output' not in args) or (args.output is None)) \
                        else Path(args.output).resolve()
     if output_path and Path(output_path).resolve().exists():
-        error_msg = (
-            f"Output filepath ``{output_path}`` already exists: could not "
-            "write in it!")
-        exit(error_msg)
+        exit_on_error((f"Output filepath ``{output_path}`` already exists: "
+                       f"could not write in it!"))
+
+    # Manage additional log, if any
+    logfile_path = None if ('log' not in args) else args.log
+    if logfile_path == '<OUTPUT>.log':
+        if output_path is None:
+            exit_on_error(f"CLI option `--log` could only be used with no "
+                          f"value if ``--output`` is already set, as value "
+                          f"of logfile path will be derived from value of "
+                          f"output path!")
+
+        ext_length = len("".join(output_path.suffixes))
+        now = datetime.now().strftime("%Y%m%d-%H%M%S")
+        logfile_path_prefix = str(output_path)[:-ext_length]
+        logfile_path = f"{logfile_path_prefix}-{now}.log"
+    if logfile_path and Path(logfile_path).resolve().exists():
+        exit_on_error((f"Additional logfile path ``{logfile_path}`` already "
+                       f"exists: could not write in it!"))
 
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in args) \
@@ -927,7 +1012,22 @@ def main():
                                path_to_walk=path_to_walk,
                                output_path=output_path)
 
+    # Start logging
+    configure_logging(logfile_path)
+    LOGGER.info(f"Will scan `{path_to_walk}`...")
+    LOGGER.info("Options are set as following:")
+    LOGGER.info(f"- sleep time (in s.): {args.sleep}")
+    if pathes_relative_to:
+        LOGGER.info(f"- set pathes relative to: `{pathes_relative_to}`")
+    if logfile_path:
+        LOGGER.info(f"- additional log file: `{logfile_path}`")
+    if len(excluded) > 0:
+        LOGGER.info(f"- excluded path patterns are:")
+        for excluded_regex in excluded:
+            LOGGER.info(f'  - ``"{excluded_regex.pattern}"``')
+
     # Walk tree and print dir. entries metadata:
+    LOGGER.info(f"Start scanning...")
     write_new_line(output_path, ENCODING, NodeInfos.colstocsv())
     for node_infos in _walk(str(path_to_walk), excluded, args.sleep):
         write_new_line(output_path, ENCODING,
