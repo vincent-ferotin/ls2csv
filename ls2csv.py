@@ -477,6 +477,67 @@ class Size:
         return f"{_size:.1f} {_unit}"
 
 
+class Options:
+    """Script options.
+    """
+    def __init__(self, script_path, working_dirpath,
+                 parsed_cli_args, root_path_walked,
+                 sleep_time=None,
+                 pathes_relative_to=None, output_path=None, logfile_path=None,
+                 excluded=None):
+        self._script_path = script_path
+        self._working_dirpath = working_dirpath
+        self._parsed_cli_args = parsed_cli_args
+        self._root_path_walked = root_path_walked
+        self._sleep_time = sleep_time
+        self._pathes_relative_to = pathes_relative_to
+        self._output_path = output_path
+        self._logfile_path = logfile_path
+        self._excluded = []
+        if excluded:
+            self._excluded.extend([exclude for exclude in excluded])
+
+    @property
+    def script_path(self):
+        return self._script_path
+
+    @property
+    def working_dirpath(self):
+        return self._working_dirpath
+
+    @property
+    def parsed_cli_args(self):
+        return self._parsed_cli_args
+
+    @property
+    def root_path_walked(self):
+        return self._root_path_walked
+
+    @property
+    def sleep_time(self):
+        return self._sleep_time
+
+    @property
+    def pathes_relative_to(self):
+        return self._pathes_relative_to
+
+    @property
+    def output_path(self):
+        return self._output_path
+
+    @property
+    def logfile_path(self):
+        return self._logfile_path
+
+    @property
+    def excluded_regex(self):
+        return self._excluded[:]
+
+    @property
+    def excluded_patterns(self):
+        return [regex.pattern for regex in self._excluded]
+
+
 # Functions  ----------------------------------------------------------------
 
 def exit_on_error(msg, return_code=1):
@@ -608,7 +669,7 @@ def get_symlink_infos(path, dir_entry=None):
 
     Arguments
     ---------
-    path : `str`
+    path : `pathlib.Path`
         Path from which retrieve informations.
     dir_entry : `os.DirEntry`
         Item resulting of `os.scandir` on parent path, if any.
@@ -703,7 +764,7 @@ def get_node_infos(path, dir_entry):
 
     Arguments
     ---------
-    path : `str`
+    path : `pathlib.Path`
         Absolute path from which retrieve informations.
     dir_entry : `os.DirEntry`
         Item resulting of `os.scandir` on parent path.
@@ -798,18 +859,15 @@ def get_node_infos(path, dir_entry):
                      error_msgs=error_msgs)
 
 
-def _walk(path, excluded=None, sleep_time=DEFAULT_TIME_SLEEP):
+def walk(path_to_walk, options):
     """Walk a given path.
 
     Arguments
     ---------
-    path : `str`
-        Absolute path to walk.
-    excluded : `list` of regexp
-        List of regexp. to exclude from further walking.
-    sleep_time : `float`
-        Approx. time to sleep, in seconds, between running two successive
-        `ls` commands on *files* (not directories).
+    path_to_walk : `pathlib.Path`
+        Path to walk.
+    optins : :class:`Options`
+        Current application options.
 
     Yields
     ------
@@ -817,22 +875,18 @@ def _walk(path, excluded=None, sleep_time=DEFAULT_TIME_SLEEP):
         List of output of shell command `ls` on walked paths as constructed
         `Node` instances.
     """
-    if excluded is None:
-        excluded = []
-
-    LOGGER.info(f"  Start scanning `{path}/` directory...")
-    with scandir(path) as dir_entries:
+    LOGGER.info(f"  Start scanning `{path_to_walk}/` directory...")
+    with scandir(path_to_walk) as dir_entries:
         for dir_entry in dir_entries:
-            path = fsdecode(dir_entry.path)
-            if match_none(path, excluded):
-                node = get_node_infos(path, dir_entry)
+            _path = fsdecode(dir_entry.path)
+            if match_none(_path, options.excluded_regex):
+                node = get_node_infos(_path, dir_entry)
 
                 yield node
-                sleep(sleep_time)
+                sleep(options.sleep_time)
 
                 if node.type == NodeType.directory:
-                    yield from _walk(path, excluded=excluded,
-                                     sleep_time=sleep_time)
+                    yield from walk(_path, options)
 
 
 # CLI  ----------------------------------------------------------------------
@@ -959,17 +1013,26 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
     return excluded
 
 
-def main():
-    """Main function, software entrypoint.
+def prepare_options(this_script_path, working_dirpath, parsed_cli_args):
+    """Prepare application global options object.
+
+    Arguments
+    ---------
+    this_script_path : `pathlib.Path`
+        Present script fullpath.
+    working_dirpath : `pathlib.Path`
+        Current working directory fullpath used when script wass called.
+    parsed_cli_args : `namespace`
+        Parsed CLI arguments, as returned by
+        `argparse.ArgumentParser.parse_args()`.
+
+    Returns
+    -------
+    :class:`Options`
+        Application configuration.
     """
-    this_script_path = Path(argv[0]).resolve()
-    working_dir = Path(getcwd()).resolve()
-
-    args_parser = create_args_parser()
-    args = args_parser.parse_args()
-
     # Parse and adjust options
-    path = "." if (args.path is None) else args.path
+    path = "." if (parsed_cli_args.path is None) else parsed_cli_args.path
     try:
         path_to_walk = Path(path).resolve(strict=True)
     except FileNotFoundError as error:
@@ -977,25 +1040,29 @@ def main():
 
     #   nodes' pathes relative to
     pathes_relative_to = None
-    if ('pathes_relative_to' in args) and (args.pathes_relative_to is not None):
-        pathes_relative_to = Path.home() if (args.pathes_relative_to == "home") \
-                                         else path_to_walk
+    if ('pathes_relative_to' in parsed_cli_args) \
+            and (parsed_cli_args.pathes_relative_to is not None):
+        pathes_relative_to = \
+            Path.home() if (parsed_cli_args.pathes_relative_to == "home") \
+                        else path_to_walk
 
     #   Manage output
-    output_path = None if (('output' not in args) or (args.output is None)) \
-                       else Path(args.output).resolve()
+    output_path = None if (('output' not in parsed_cli_args)
+                            or (parsed_cli_args.output is None)) \
+                       else Path(parsed_cli_args.output).resolve()
     if output_path and Path(output_path).resolve().exists():
         exit_on_error((f"Output filepath ``{output_path}`` already exists: "
                        f"could not write in it!"))
 
     # Manage additional log, if any
-    logfile_path = None if ('log' not in args) else args.log
+    logfile_path = None if ('log' not in parsed_cli_args) \
+                        else parsed_cli_args.log
     if logfile_path == '<OUTPUT>.log':
         if output_path is None:
-            exit_on_error(f"CLI option `--log` could only be used with no "
-                          f"value if ``--output`` is already set, as value "
-                          f"of logfile path will be derived from value of "
-                          f"output path!")
+            exit_on_error((
+                f"CLI option `--log` could only be used with no value if "
+                f"``--output`` is already set, as value of logfile path will "
+                f"be derived from value of output path!"))
 
         ext_length = len("".join(output_path.suffixes))
         now = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1006,33 +1073,60 @@ def main():
                        f"exists: could not write in it!"))
 
     #   Construct list of pathes to exclude
-    excluded = [] if ("exclude" not in args) \
-                    else set(args.exclude.split(','))
+    excluded = [] if ("exclude" not in parsed_cli_args) \
+                    else set(parsed_cli_args.exclude.split(','))
     excluded = extend_excluded(excluded, script_path=this_script_path,
                                path_to_walk=path_to_walk,
                                output_path=output_path)
 
+    # Return application options container
+    return Options(this_script_path, working_dirpath, parsed_cli_args,
+                   path_to_walk, sleep_time=parsed_cli_args.sleep,
+                   pathes_relative_to=pathes_relative_to,
+                   output_path=output_path, logfile_path=logfile_path,
+                   excluded=excluded)
+
+
+def main():
+    """Main function, software entrypoint.
+    """
+    this_script_path = Path(argv[0]).resolve()
+    working_dirpath = Path(getcwd()).resolve()
+
+    args_parser = create_args_parser()
+    parsed_cli_args = args_parser.parse_args()
+
+    # Continue application configuration
+    options = prepare_options(this_script_path, working_dirpath,
+                              parsed_cli_args)
+    configure_logging(options.logfile_path)
+
     # Start logging
-    configure_logging(logfile_path)
-    LOGGER.info(f"Will scan `{path_to_walk}`...")
+    LOGGER.info(f"Will scan `{options.root_path_walked}`...")
     LOGGER.info("Options are set as following:")
-    LOGGER.info(f"- sleep time (in s.): {args.sleep}")
-    if pathes_relative_to:
-        LOGGER.info(f"- set pathes relative to: `{pathes_relative_to}`")
-    if logfile_path:
-        LOGGER.info(f"- additional log file: `{logfile_path}`")
-    if len(excluded) > 0:
+    LOGGER.info(f"- current Python script path: {options.script_path}")
+    LOGGER.info(f"- current working directory: {options.working_dirpath}")
+    LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
+    if options.pathes_relative_to:
+        LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
+    if options.output_path:
+        LOGGER.info(f"- output of scan file: `{options.output_path}`")
+    if options.logfile_path:
+        LOGGER.info(f"- additional log file: `{options.logfile_path}`")
+    if len(options.excluded_regex) > 0:
         LOGGER.info(f"- excluded path patterns are:")
-        for excluded_regex in excluded:
-            LOGGER.info(f'  - ``"{excluded_regex.pattern}"``')
+        for excluded_pattern in options.excluded_patterns:
+            LOGGER.info(f'  - ``"{excluded_pattern}"``')
 
     # Walk tree and print dir. entries metadata:
     LOGGER.info(f"Start scanning...")
-    write_new_line(output_path, ENCODING, NodeInfos.colstocsv())
-    for node_infos in _walk(str(path_to_walk), excluded, args.sleep):
-        write_new_line(output_path, ENCODING,
-                       node_infos.tocsv(pathes_relative_to=pathes_relative_to))
+    write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
+    for node_infos in walk(options.root_path_walked, options):
+        write_new_line(options.output_path, ENCODING,
+                       node_infos.tocsv(pathes_relative_to=options.pathes_relative_to))
 
+    # End of run!
+    LOGGER.info(f"Stop scanning: job finished!")
     return 0
 
 
