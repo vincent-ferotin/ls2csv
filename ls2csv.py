@@ -1135,13 +1135,12 @@ def main():
     LOGGER.info(f"- current Python script path: {options.script_path}")
     LOGGER.info(f"- current working directory: {options.working_dirpath}")
     LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
-    if options.pathes_relative_to:
-        LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
-    if options.output_path:
-        LOGGER.info(f"- output of scan file: `{options.output_path}`")
-    if options.logfile_path:
-        LOGGER.info(f"- additional log file: `{options.logfile_path}`")
-    if len(options.excluded_regex) > 0:
+    LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
+    LOGGER.info(f"- output of scan file: `{options.output_path}`")
+    LOGGER.info(f"- additional log file: `{options.logfile_path}`")
+    if len(options.excluded_regex) == 0:
+        LOGGER.info(f"- excluded path patterns are: []")
+    else:
         LOGGER.info(f"- excluded path patterns are:")
         for excluded_pattern in options.excluded_patterns:
             LOGGER.info(f'  - ``"{excluded_pattern}"``')
