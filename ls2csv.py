@@ -634,8 +634,8 @@ def write_new_line(filepath=None, encoding=None, content=None):
         file_.write(content + "\n")
 
 
-def match_none(path, regex_patterns):
-    """Tell if a given path match none of all regex patterns.
+def match_any(path, regex_patterns):
+    """Tell if a given path match any of all regex patterns.
 
     Arguments
     ---------
@@ -647,15 +647,17 @@ def match_none(path, regex_patterns):
     Returns
     -------
     `bool`
-        ``True`` if all patterns of :param:`regex_patterns` do *not* match
-        :param:`path` (i.e. none pattern match path);
-        ``False`` otherwise (if any pattern match path).
+        ``True`` if at least one pattern in :param:`regex_patterns`
+        *matches* :param:`path`; ``False`` otherwise (if none pattern
+        match path).
     """
     for pattern in regex_patterns:
         match = pattern.match(str(path))
         if match:
-            return False
-    return True
+            return True
+    return False
+
+match_none = lambda path, regex_patterns: not match_any(path, regex_patterns)
 
 
 def read_file_content(path):
@@ -879,13 +881,39 @@ def get_node_infos(path, dir_entry):
                      error_msgs=error_msgs)
 
 
+def process(parent_dirpath, dir_entry, options):
+    """Process some node's path.
+
+    Arguments
+    ---------
+    parent_dirpath : `pathlib.Path`
+        Node's praent path.
+    dir_entry : `os.DirEntry`
+        Parent's directory entry corresponding to present node, as returned
+        by `os.scandir`.
+    options : :class:`Options`
+        Current application options.
+
+    Returns
+    -------
+    `NodeInfos` or ``None``
+        Node's metadata, or ``None`` if its path has to be excluded as set
+        in :param:`options`.
+    """
+    node_path = parent_dirpath / fsdecode(dir_entry.name)
+    if match_any(node_path, options.excluded_regex):
+        return None
+
+    return get_node_infos(node_path, dir_entry)
+
+
 def walk(path_to_walk, options):
     """Walk a given path.
 
     Arguments
     ---------
     path_to_walk : `pathlib.Path`
-        Path to walk.
+        Directory path to walk.
     optins : :class:`Options`
         Current application options.
 
@@ -899,15 +927,40 @@ def walk(path_to_walk, options):
                  "directory..."))
     with scandir(path_to_walk) as dir_entries:
         for dir_entry in dir_entries:
-            _path = path_to_walk / fsdecode(dir_entry.path)
-            if match_none(_path, options.excluded_regex):
-                node = get_node_infos(_path, dir_entry)
+            node = process(path_to_walk, dir_entry, options)
 
+            if node:
                 yield node
                 sleep(options.sleep_time)
 
                 if node.type == NodeType.directory:
                     yield from walk(_path, options)
+
+
+def process_only(node_path, options):
+    """Process some terminal node's path.
+
+    Arguments
+    ---------
+    node_path : `pathlib.Path`
+        Node's path to process.
+    options : :class:`Options`
+        Current application options.
+
+    Returns
+    -------
+    `NodeInfos` or ``None``
+        Node's metadata, or ``None`` if :param:`node_path` has to be excluded
+        as set in :param:`options`.
+    """
+    # Search for `os.DirEntry` corresponding to :param:`node_path`
+    parent_dirpath = node_path.parent
+    with scandir(parent_dirpath) as dir_entries:
+        for dir_entry in dir_entries:
+            if dir_entry.name == node_path.name:
+                node = process(parent_dirpath, dir_entry, options)
+                if node:
+                    return node
 
 
 # CLI  ----------------------------------------------------------------------
@@ -1115,6 +1168,56 @@ def prepare_options(this_script_path, working_dirpath, parsed_cli_args):
                    excluded=excluded)
 
 
+def log_options(options):
+    """Start logging application run options.
+
+    Arguments
+    ---------
+    options : :class:`Options`
+        Application options.
+    """
+    LOGGER.info(f"Will scan `{options.root_path_walked}`...")
+    LOGGER.info("Options are set as following:")
+    LOGGER.info(f"- current Python script path: {options.script_path}")
+    LOGGER.info(f"- current working directory: {options.working_dirpath}")
+    LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
+    LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
+    LOGGER.info(f"- output of scan file: `{options.output_path}`")
+    LOGGER.info(f"- additional log file: `{options.logfile_path}`")
+
+    excluded_patterns = options.excluded_patterns
+    if len(excluded_patterns) == 0:
+        LOGGER.info(f"- excluded path patterns are: []")
+    else:
+        LOGGER.info(f"- excluded path patterns are:")
+        for excluded_pattern in excluded_patterns:
+            LOGGER.info(f'  - ``"{excluded_pattern}"``')
+
+
+def _main(options):
+    """Core function of Main function.
+    """
+    # Walk tree and print dir. entries metadata:
+    write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
+
+    #   Process node(s)
+    starting_path = options.root_path_walked
+    pathes_relative_to = options.pathes_relative_to
+    output_path = options.output_path
+
+    #       Case of terminal node (e.g. file):
+    if not starting_path.is_dir():
+        node_infos = process_only(starting_path, options)
+        if node_infos:
+            write_new_line(output_path, ENCODING,
+                           node_infos.tocsv(pathes_relative_to))
+    else:
+        #       Nominal case of a directory:
+        for node_infos in walk(starting_path, options):
+            write_new_line(output_path, ENCODING,
+                           node_infos.tocsv(pathes_relative_to))
+
+
 def main():
     """Main function, software entrypoint.
     """
@@ -1130,27 +1233,12 @@ def main():
     configure_logging(options.logfile_path)
 
     # Start logging
-    LOGGER.info(f"Will scan `{options.root_path_walked}`...")
-    LOGGER.info("Options are set as following:")
-    LOGGER.info(f"- current Python script path: {options.script_path}")
-    LOGGER.info(f"- current working directory: {options.working_dirpath}")
-    LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
-    LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
-    LOGGER.info(f"- output of scan file: `{options.output_path}`")
-    LOGGER.info(f"- additional log file: `{options.logfile_path}`")
-    if len(options.excluded_regex) == 0:
-        LOGGER.info(f"- excluded path patterns are: []")
-    else:
-        LOGGER.info(f"- excluded path patterns are:")
-        for excluded_pattern in options.excluded_patterns:
-            LOGGER.info(f'  - ``"{excluded_pattern}"``')
+    log_options(options)
 
     # Walk tree and print dir. entries metadata:
     LOGGER.info(f"Start scanning...")
-    write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
-    for node_infos in walk(options.root_path_walked, options):
-        write_new_line(options.output_path, ENCODING,
-                       node_infos.tocsv(pathes_relative_to=options.pathes_relative_to))
+
+    _main(options)
 
     # End of run!
     LOGGER.info(f"Stop scanning: job finished!")
