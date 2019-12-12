@@ -20,6 +20,7 @@ from logging import (
 from os import (
     fsdecode,
     getcwd,
+    getpid,
     readlink,
     scandir,
 )
@@ -477,16 +478,43 @@ class Size:
         return f"{_size:.1f} {_unit}"
 
 
+class AppRunInfos:
+    """Set of informations about current application run.
+    """
+    def __init__(self):
+        self._script_path = Path(argv[0]).resolve(strict=True)
+        self._working_dirpath = Path(getcwd()).resolve(strict=True)
+        self._pid = getpid()
+        self._start_datetime = datetime.now()
+
+    @property
+    def script_path(self):
+        return self._script_path
+
+    @property
+    def working_dirpath(self):
+        return self._working_dirpath
+
+    @property
+    def pid(self):
+        return self._pid
+
+    @property
+    def start_datetime(self):
+        return self._start_datetime
+
+    @property
+    def start_datetime_as_isoformat(self):
+        return self._start_datetime.isoformat()
+
+
 class Options:
     """Script options.
     """
-    def __init__(self, script_path, working_dirpath,
-                 parsed_cli_args, root_path_walked,
+    def __init__(self, parsed_cli_args, root_path_walked,
                  sleep_time=None,
                  pathes_relative_to=None, output_path=None, logfile_path=None,
                  excluded=None):
-        self._script_path = script_path
-        self._working_dirpath = working_dirpath
         self._parsed_cli_args = parsed_cli_args
         self._root_path_walked = root_path_walked
         self._sleep_time = sleep_time
@@ -496,14 +524,6 @@ class Options:
         self._excluded = []
         if excluded:
             self._excluded.extend([exclude for exclude in excluded])
-
-    @property
-    def script_path(self):
-        return self._script_path
-
-    @property
-    def working_dirpath(self):
-        return self._working_dirpath
 
     @property
     def parsed_cli_args(self):
@@ -1087,15 +1107,13 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
     return excluded
 
 
-def prepare_options(this_script_path, working_dirpath, parsed_cli_args):
+def prepare_options(app_run_infos, parsed_cli_args):
     """Prepare application global options object.
 
     Arguments
     ---------
-    this_script_path : `pathlib.Path`
-        Present script fullpath.
-    working_dirpath : `pathlib.Path`
-        Current working directory fullpath used when script wass called.
+    app_run_infos : :class:`AppRunInfos`
+        Application's run informations.
     parsed_cli_args : `namespace`
         Parsed CLI arguments, as returned by
         `argparse.ArgumentParser.parse_args()`.
@@ -1156,30 +1174,35 @@ def prepare_options(this_script_path, working_dirpath, parsed_cli_args):
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
-    excluded = extend_excluded(excluded, script_path=this_script_path,
+    excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
                                path_to_walk=path_to_walk,
                                output_path=output_path)
 
     # Return application options container
-    return Options(this_script_path, working_dirpath, parsed_cli_args,
-                   path_to_walk, sleep_time=parsed_cli_args.sleep,
+    return Options(parsed_cli_args, path_to_walk,
+                   sleep_time=parsed_cli_args.sleep,
                    pathes_relative_to=pathes_relative_to,
                    output_path=output_path, logfile_path=logfile_path,
                    excluded=excluded)
 
 
-def log_options(options):
+def log_infos(app_run_infos, options):
     """Start logging application run options.
 
     Arguments
     ---------
+    app_run_infos : :class:`AppRunInfos`
+        Application's run informations.
     options : :class:`Options`
         Application options.
     """
+    LOGGER.info("Application run informations:")
+    LOGGER.info(f"- current Python script path: {app_run_infos.script_path}")
+    LOGGER.info(f"- current working directory: {app_run_infos.working_dirpath}")
+    LOGGER.info(f"- process id (pid): {app_run_infos.pid}")
+    LOGGER.info(f"- start date/time: {app_run_infos.start_datetime_as_isoformat}")
     LOGGER.info(f"Will scan `{options.root_path_walked}`...")
     LOGGER.info("Options are set as following:")
-    LOGGER.info(f"- current Python script path: {options.script_path}")
-    LOGGER.info(f"- current working directory: {options.working_dirpath}")
     LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
     LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
     LOGGER.info(f"- output of scan file: `{options.output_path}`")
@@ -1221,19 +1244,17 @@ def _main(options):
 def main():
     """Main function, software entrypoint.
     """
-    this_script_path = Path(argv[0]).resolve()
-    working_dirpath = Path(getcwd()).resolve()
+    app_run_infos = AppRunInfos()
 
     args_parser = create_args_parser()
     parsed_cli_args = args_parser.parse_args()
 
     # Continue application configuration
-    options = prepare_options(this_script_path, working_dirpath,
-                              parsed_cli_args)
+    options = prepare_options(app_run_infos, parsed_cli_args)
     configure_logging(options.logfile_path)
 
     # Start logging
-    log_options(options)
+    log_infos(app_run_infos, options)
 
     # Walk tree and print dir. entries metadata:
     LOGGER.info(f"Start scanning...")
