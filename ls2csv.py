@@ -36,7 +36,10 @@ from os.path import (
     join,
 )
 from pathlib import Path
-from re import compile as compile_
+from re import (
+    compile as compile_,
+    escape,
+)
 from subprocess import (
     CalledProcessError,
     PIPE,
@@ -136,8 +139,8 @@ LS_OUTPUT_REGEX = compile_(''
 ENCODING="utf-8"
 
 DEFAULT_EXCLUDED = [
-    r"\.cache/",
-    r"\.composer/",
+    r".cache/",
+    r".composer/",
     r"admin/mail/",
     r"admin/config/apache/run/",
 ]
@@ -991,7 +994,9 @@ def create_args_parser():
     parser = ArgumentParser(description=SCRIPT_DESC)
     parser.add_argument('--exclude', default=",".join(DEFAULT_EXCLUDED),
                         help=("list of paths to exclude from walking, comma "
-                              "separated (e.g. 'path1,path2')."))
+                              "separated (e.g. 'path1,path2'). In order to "
+                              "exclude a directory and all of its children, "
+                              "let suffix its path wirth a slash (``/``)."))
     parser.add_argument('--sleep', type=float, default=DEFAULT_TIME_SLEEP,
                         help=("Approx. time to sleep, in seconds, between "
                               "running two successive `ls` commands on *files* "
@@ -1059,7 +1064,8 @@ def configure_logging(logfile_path=None, encoding=ENCODING,
     LOGGER.setLevel(level)
 
 
-def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
+def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
+                    logfile_path=None):
     """Enhance path excluded list with current script name and optional
     output path.
 
@@ -1073,6 +1079,8 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
         Absolute path to walk.
     output_path : :class:`pathlib.Path`
         CSV output absolute filepath, if any.
+    logfile_path : :class:`pathlib.Path`
+        Logfile path, if any.
 
     Returns
     -------
@@ -1082,26 +1090,30 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None):
     """
     _excluded = []
 
-    # Transform any path in absolute :class:`pathlib.Path`
+    # Transform any path in absolute path as `str`
     for path in excluded:
-        path = Path(path)
-        if not path.is_absolute():
+        if not path.startswith('/'):
             # path is assumed relative to `path_to_walk`
-            _excluded.append(path_to_walk / path)
-        else:
-            _excluded.append(path)
+            path = join(path_to_walk, path)
+        _excluded.append(path)
 
     # Append current paths to excluded list
-    _excluded.append(script_path)
+    _excluded.append(str(script_path))
     if output_path:
-        _excluded.append(output_path)
+        _excluded.append(str(output_path))
+    if logfile_path:
+        _excluded.append(str(logfile_path))
 
     # Transform path in regex objects
     excluded = []
     for path in _excluded:
-        path = str(path)
-        if path.endswith('/'):
-            path += '.*'
+        is_path_dir = path.endswith('/')
+        path = escape(str(Path(path).resolve()))
+        if is_path_dir:
+            # Exclude both dirpath (without its optional slash) and
+            # all of its children. Note that previous leading slash was stripped
+            # Path.resolve transformation.
+            path += '(/.*)?'
         excluded.append(compile_(f"^{path}$"))
 
     return excluded
@@ -1167,16 +1179,19 @@ def prepare_options(app_run_infos, parsed_cli_args):
         now = datetime.now().strftime("%Y%m%d-%H%M%S")
         logfile_path_prefix = str(output_path)[:-ext_length]
         logfile_path = f"{logfile_path_prefix}-{now}.log"
-    if logfile_path and Path(logfile_path).resolve().exists():
-        exit_on_error((f"Additional logfile path ``{logfile_path}`` already "
-                       f"exists: could not write in it!"))
+    if logfile_path:
+        logfile_path = Path(logfile_path).resolve()
+        if logfile_path.exists():
+            exit_on_error((f"Additional logfile path ``{logfile_path}`` "
+                           f"already exists: could not write in it!"))
 
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
     excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
                                path_to_walk=path_to_walk,
-                               output_path=output_path)
+                               output_path=output_path,
+                               logfile_path=logfile_path)
 
     # Return application options container
     return Options(parsed_cli_args, path_to_walk,
