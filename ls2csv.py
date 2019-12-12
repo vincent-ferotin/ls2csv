@@ -517,7 +517,7 @@ class Options:
     def __init__(self, parsed_cli_args, root_path_walked,
                  sleep_time=None,
                  pathes_relative_to=None, output_path=None, logfile_path=None,
-                 excluded=None):
+                 excluded=None, excluded_relative_to=None):
         self._parsed_cli_args = parsed_cli_args
         self._root_path_walked = root_path_walked
         self._sleep_time = sleep_time
@@ -527,6 +527,7 @@ class Options:
         self._excluded = []
         if excluded:
             self._excluded.extend([exclude for exclude in excluded])
+        self._excluded_relative_to = excluded_relative_to
 
     @property
     def parsed_cli_args(self):
@@ -559,6 +560,10 @@ class Options:
     @property
     def excluded_patterns(self):
         return [regex.pattern for regex in self._excluded]
+
+    @property
+    def excluded_relative_to(self):
+        return self._excluded_relative_to
 
     def get_path(self, path):
         """Get a filesystem path in a form respecting `pathes_relative_to`
@@ -996,7 +1001,16 @@ def create_args_parser():
                         help=("list of paths to exclude from walking, comma "
                               "separated (e.g. 'path1,path2'). In order to "
                               "exclude a directory and all of its children, "
-                              "let suffix its path wirth a slash (``/``)."))
+                              "let suffix its path wirth a slash (``/``). "
+                              "If paths are relative, they will be resolve "
+                              "as relative to path set by "
+                              "`--excluded-relative-to` option."))
+    parser.add_argument('--excluded-relative-to',
+                        help=("Path to which relative ones defined as "
+                              "excluded (see `--exclude` option) are relative "
+                              "to. Common options are ``<HOME>`` or "
+                              "``<WALKED>``, for either user's home or walked "
+                              "path."))
     parser.add_argument('--sleep', type=float, default=DEFAULT_TIME_SLEEP,
                         help=("Approx. time to sleep, in seconds, between "
                               "running two successive `ls` commands on *files* "
@@ -1065,7 +1079,7 @@ def configure_logging(logfile_path=None, encoding=ENCODING,
 
 
 def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
-                    logfile_path=None):
+                    logfile_path=None, excluded_relative_to=None):
     """Enhance path excluded list with current script name and optional
     output path.
 
@@ -1081,6 +1095,8 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
         CSV output absolute filepath, if any.
     logfile_path : :class:`pathlib.Path`
         Logfile path, if any.
+    excluded_relative_to : :class:`pathlib.Path`
+        Absolute path from which relative excluded one will be relative to.
 
     Returns
     -------
@@ -1093,8 +1109,7 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
     # Transform any path in absolute path as `str`
     for path in excluded:
         if not path.startswith('/'):
-            # path is assumed relative to `path_to_walk`
-            path = join(path_to_walk, path)
+            path = join(excluded_relative_to, path)
         _excluded.append(path)
 
     # Append current paths to excluded list
@@ -1185,20 +1200,33 @@ def prepare_options(app_run_infos, parsed_cli_args):
             exit_on_error((f"Additional logfile path ``{logfile_path}`` "
                            f"already exists: could not write in it!"))
 
+    #   Excluded pathes relative to
+    excluded_relative_to = None
+    if ('excluded_relative_to' in parsed_cli_args) \
+            and (parsed_cli_args.excluded_relative_to is not None):
+        _excluded_relative_to = parsed_cli_args.excluded_relative_to
+        if _excluded_relative_to == "<HOME>":
+            excluded_relative_to = Path.home()
+        elif _excluded_relative_to == "<WALKED>":
+            excluded_relative_to = path_to_walk
+        else:
+            excluded_relative_to = Path(_excluded_relative_to).resolve()
+
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
     excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
                                path_to_walk=path_to_walk,
                                output_path=output_path,
-                               logfile_path=logfile_path)
+                               logfile_path=logfile_path,
+                               excluded_relative_to=excluded_relative_to)
 
     # Return application options container
     return Options(parsed_cli_args, path_to_walk,
                    sleep_time=parsed_cli_args.sleep,
                    pathes_relative_to=pathes_relative_to,
                    output_path=output_path, logfile_path=logfile_path,
-                   excluded=excluded)
+                   excluded=excluded, excluded_relative_to=excluded_relative_to)
 
 
 def log_infos(app_run_infos, options):
@@ -1222,6 +1250,7 @@ def log_infos(app_run_infos, options):
     LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
     LOGGER.info(f"- output of scan file: `{options.output_path}`")
     LOGGER.info(f"- additional log file: `{options.logfile_path}`")
+    LOGGER.info(f"- set excluded pathes relative to: `{options.excluded_relative_to}`")
 
     excluded_patterns = options.excluded_patterns
     if len(excluded_patterns) == 0:
