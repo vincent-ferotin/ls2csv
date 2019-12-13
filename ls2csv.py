@@ -1005,12 +1005,12 @@ def create_args_parser():
                               "If paths are relative, they will be resolve "
                               "as relative to path set by "
                               "`--excluded-relative-to` option."))
-    parser.add_argument('--excluded-relative-to',
+    parser.add_argument('--excluded-relative-to', default="<WALKED>",
                         help=("Path to which relative ones defined as "
                               "excluded (see `--exclude` option) are relative "
                               "to. Common options are ``<HOME>`` or "
                               "``<WALKED>``, for either user's home or walked "
-                              "path."))
+                              "path. Default to ``<WALKED>``."))
     parser.add_argument('--sleep', type=float, default=DEFAULT_TIME_SLEEP,
                         help=("Approx. time to sleep, in seconds, between "
                               "running two successive `ls` commands on *files* "
@@ -1078,8 +1078,8 @@ def configure_logging(logfile_path=None, encoding=ENCODING,
     LOGGER.setLevel(level)
 
 
-def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
-                    logfile_path=None, excluded_relative_to=None):
+def extend_excluded(excluded, script_path, path_to_walk, excluded_relative_to,
+                    output_path=None, logfile_path=None):
     """Enhance path excluded list with current script name and optional
     output path.
 
@@ -1091,12 +1091,12 @@ def extend_excluded(excluded, script_path, path_to_walk, output_path=None,
         This current script absolute path, as called by Python.
     path_to_walk : :class:`pathlib.Path`
         Absolute path to walk.
+    excluded_relative_to : :class:`pathlib.Path`
+        Absolute path from which relative excluded one will be relative to.
     output_path : :class:`pathlib.Path`
         CSV output absolute filepath, if any.
     logfile_path : :class:`pathlib.Path`
         Logfile path, if any.
-    excluded_relative_to : :class:`pathlib.Path`
-        Absolute path from which relative excluded one will be relative to.
 
     Returns
     -------
@@ -1201,25 +1201,22 @@ def prepare_options(app_run_infos, parsed_cli_args):
                            f"already exists: could not write in it!"))
 
     #   Excluded pathes relative to
-    excluded_relative_to = None
-    if ('excluded_relative_to' in parsed_cli_args) \
-            and (parsed_cli_args.excluded_relative_to is not None):
-        _excluded_relative_to = parsed_cli_args.excluded_relative_to
-        if _excluded_relative_to == "<HOME>":
-            excluded_relative_to = Path.home()
-        elif _excluded_relative_to == "<WALKED>":
-            excluded_relative_to = path_to_walk
-        else:
-            excluded_relative_to = Path(_excluded_relative_to).resolve()
+    _excluded_relative_to = parsed_cli_args.excluded_relative_to
+    if _excluded_relative_to == "<HOME>":
+        excluded_relative_to = Path.home()
+    elif _excluded_relative_to == "<WALKED>":
+        excluded_relative_to = path_to_walk
+    else:
+        excluded_relative_to = Path(_excluded_relative_to).resolve()
 
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
     excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
                                path_to_walk=path_to_walk,
+                               excluded_relative_to=excluded_relative_to,
                                output_path=output_path,
-                               logfile_path=logfile_path,
-                               excluded_relative_to=excluded_relative_to)
+                               logfile_path=logfile_path)
 
     # Return application options container
     return Options(parsed_cli_args, path_to_walk,
