@@ -62,6 +62,11 @@ LOGGER = getLogger(__name__)
 
 DEFAULT_LOG_LEVEL = INFO
 
+DEFAULT_CHECKSUM_ALGORITHM = "md5"
+HASH_FUNCTIONS = {
+    'md5': md5,
+}
+
 # `ls` command and options:
 #
 # -A:   id. --all but skip `.` and `..`
@@ -196,7 +201,7 @@ class NodeInfos:
                  links_nb=None, size=None,
                  perms=None, user_owner=None, group_owner=None, security=None,
                  atime=None, mtime=None, ctime=None,
-                 symlink=None, symlink_type=None, md5sum=None,
+                 symlink=None, symlink_type=None, checksums=None,
                  error_msgs=None):
         self._path = Path(path) if isinstance(path, str) else path
         self._type = type_
@@ -228,7 +233,9 @@ class NodeInfos:
                 self._ctime = ctime
         self._symlink = Path(symlink) if isinstance(symlink, str) else symlink
         self._symlink_type = symlink_type
-        self._md5sum = md5sum
+        self._checksums = dict()
+        if checksums:
+            self._checksums.update(checksums)
 
         self._error_msgs = []
         if error_msgs:
@@ -346,12 +353,37 @@ class NodeInfos:
         return self._symlink_type
 
     @property
-    def md5sum(self):
-        return self._md5sum
+    def checksums(self):
+        return self._checksums.copy()
 
-    @md5sum.setter
-    def md5sum(self, md5sum):
-        self._md5sum = md5sum
+    def add_checksum(self, algorithm, checksum):
+        """Add a checksum to checksums collection.
+
+        Arguments
+        ---------
+        algorithm : `str`
+            Algorithm used for generating :param:`checksum`.
+        checksum : `str`
+            Hexadecimal digest of checksum of current node's content with
+            :param:`algorithm`.
+        """
+        self._checksums[algorithm] = checksum
+
+    def get_checksum(self, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
+        """Get current checksum for a given algorithm.
+
+        Arguments
+        ---------
+        algorithm : `str`
+            Algorithm used for generating desired checksum.
+
+        Returns
+        -------
+        `str` or ``None``
+            Hexadecimal digest of checksum of current node's content with
+            :param:`algorithm`.
+        """
+        return self._checksums.get(algorithm)
 
     @property
     def error_msgs(self):
@@ -380,6 +412,7 @@ class NodeInfos:
             "ctime (ISO 8601 format)",
             "Sym.Link to path",
             "Type of Sym.Link",
+            "MD5 checksum",
             "Error message(s)",
         ])
 
@@ -402,6 +435,7 @@ class NodeInfos:
             self.ctime_as_isoformat,
             self.get_symlink(relative_to=pathes_relative_to),
             self.symlink_type,
+            self.get_checksum('md5'),
             self.error_msgs,
         ])
 
@@ -517,7 +551,7 @@ class Options:
     def __init__(self, parsed_cli_args, root_path_walked,
                  sleep_time=None,
                  pathes_relative_to=None, output_path=None, logfile_path=None,
-                 excluded=None, excluded_relative_to=None):
+                 excluded=None, excluded_relative_to=None, checksum=None):
         self._parsed_cli_args = parsed_cli_args
         self._root_path_walked = root_path_walked
         self._sleep_time = sleep_time
@@ -528,6 +562,7 @@ class Options:
         if excluded:
             self._excluded.extend([exclude for exclude in excluded])
         self._excluded_relative_to = excluded_relative_to
+        self._checksum = checksum
 
     @property
     def parsed_cli_args(self):
@@ -564,6 +599,10 @@ class Options:
     @property
     def excluded_relative_to(self):
         return self._excluded_relative_to
+
+    @property
+    def checksum(self):
+        return self._checksum
 
     def get_path(self, path):
         """Get a filesystem path in a form respecting `pathes_relative_to`
@@ -705,7 +744,7 @@ def read_file_content(path):
 
     try:
         with open(path, mode='rb') as file_:
-            content = file_.readall()
+            content = file_.read()
     except OSError as error:
         error_msg = (
             f"Unable to open and read ``{node_infos.path}`` file: "
@@ -778,13 +817,15 @@ def get_symlink_infos(path, dir_entry=None):
                                error_msg)
 
 
-def get_node_content_hash(node_infos):
+def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
     """Get a MD5 hash hexadecimal digest from content of a node.
 
     Arguments
     ---------
     node_infos : `NodeInfos`
         Node info whose path will be tried to be red for computing hash.
+    algorithm : `str`
+        Algorithm to use on node's content to generage checksum.
 
     Returns
     -------
@@ -803,8 +844,8 @@ def get_node_content_hash(node_infos):
         return None
     # else:
 
-    hash_ = md5()
-    hash_.update(content)
+    hash_ = (HASH_FUNCTIONS[algorithm])()
+    hash_.update(file_content.content)
 
     return hash_.hexdigest()
 
@@ -932,7 +973,14 @@ def process(parent_dirpath, dir_entry, options):
     if match_any(node_path, options.excluded_regex):
         return None
 
-    return get_node_infos(node_path, dir_entry)
+    node_infos = get_node_infos(node_path, dir_entry)
+
+    if options.checksum:
+        algorithm = options.checksum
+        node_infos.add_checksum(algorithm,
+                                get_node_content_checksum(node_infos, algorithm))
+
+    return node_infos
 
 
 def walk(path_to_walk, options):
@@ -1032,6 +1080,10 @@ def create_args_parser():
                               "Script will try to convert pathes if this "
                               "is possible; else, or if option is not set, "
                               "all pathes will be absolute."))
+    parser.add_argument('-c', '--checksum', nargs='?', choices=['md5'],
+                        default=None, const=DEFAULT_CHECKSUM_ALGORITHM,
+                        help=("Set walker to also compute a checksum for each "
+                              "encountered file, and which algorithm to use."))
     parser.add_argument('path', nargs='?',
                         help="path to walk. Default to `.`.")
     return parser
@@ -1223,7 +1275,8 @@ def prepare_options(app_run_infos, parsed_cli_args):
                    sleep_time=parsed_cli_args.sleep,
                    pathes_relative_to=pathes_relative_to,
                    output_path=output_path, logfile_path=logfile_path,
-                   excluded=excluded, excluded_relative_to=excluded_relative_to)
+                   excluded=excluded, excluded_relative_to=excluded_relative_to,
+                   checksum=parsed_cli_args.checksum)
 
 
 def log_infos(app_run_infos, options):
@@ -1244,6 +1297,7 @@ def log_infos(app_run_infos, options):
     LOGGER.info(f"Will scan `{options.root_path_walked}`...")
     LOGGER.info("Options are set as following:")
     LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
+    LOGGER.info(f"- checksum algorithm to use, if any: {options.checksum}")
     LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
     LOGGER.info(f"- output of scan file: `{options.output_path}`")
     LOGGER.info(f"- additional log file: `{options.logfile_path}`")
