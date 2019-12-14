@@ -249,7 +249,7 @@ class NodeInfos:
         if self._path is None:
             return None
         # else:
-        return str(self._path)
+        return Path(self._path)
 
     def get_path(self, relative_to=None):
         if self._path is None:
@@ -548,12 +548,12 @@ class AppRunInfos:
 class Options:
     """Script options.
     """
-    def __init__(self, parsed_cli_args, root_path_walked,
+    def __init__(self, parsed_cli_args, walked_pathes,
                  sleep_time=None,
                  pathes_relative_to=None, output_path=None, logfile_path=None,
                  excluded=None, excluded_relative_to=None, checksum=None):
         self._parsed_cli_args = parsed_cli_args
-        self._root_path_walked = root_path_walked
+        self._walked_pathes = list(walked_pathes)
         self._sleep_time = sleep_time
         self._pathes_relative_to = pathes_relative_to
         self._output_path = output_path
@@ -569,8 +569,8 @@ class Options:
         return self._parsed_cli_args
 
     @property
-    def root_path_walked(self):
-        return self._root_path_walked
+    def walked_pathes(self):
+        return self._walked_pathes[:]
 
     @property
     def sleep_time(self):
@@ -1010,7 +1010,7 @@ def walk(path_to_walk, options):
                 sleep(options.sleep_time)
 
                 if node.type == NodeType.directory:
-                    yield from walk(_path, options)
+                    yield from walk(node.path, options)
 
 
 def process_only(node_path, options):
@@ -1058,7 +1058,7 @@ def create_args_parser():
                               "excluded (see `--exclude` option) are relative "
                               "to. Common options are ``<HOME>`` or "
                               "``<WALKED>``, for either user's home or walked "
-                              "path. Default to ``<WALKED>``."))
+                              "path (if only one). Default to ``<WALKED>``."))
     parser.add_argument('--sleep', type=float, default=DEFAULT_TIME_SLEEP,
                         help=("Approx. time to sleep, in seconds, between "
                               "running two successive `ls` commands on *files* "
@@ -1073,19 +1073,19 @@ def create_args_parser():
                               "and in which filepath log entries will be "
                               "stored; if no value is set, a path derived from "
                               "value of `output` option will be used."))
-    parser.add_argument('--pathes-relative-to',
+    parser.add_argument('--pathes-relative-to', default="<WALKED>",
                         help=("Store walked pathes as relative to some other. "
                               "Common options are ``<HOME>`` or ``<WALKED>``, "
-                              "for either user's home or walked path. "
-                              "Script will try to convert pathes if this "
+                              "for either user's home or walked path (if only "
+                              "one). Script will try to convert pathes if this "
                               "is possible; else, or if option is not set, "
                               "all pathes will be absolute."))
     parser.add_argument('-c', '--checksum', nargs='?', choices=['md5'],
                         default=None, const=DEFAULT_CHECKSUM_ALGORITHM,
                         help=("Set walker to also compute a checksum for each "
                               "encountered file, and which algorithm to use."))
-    parser.add_argument('path', nargs='?',
-                        help="path to walk. Default to `.`.")
+    parser.add_argument('pathes', nargs='*',
+                        help="Pathes to walk. If not set, default to `.`.")
     return parser
 
 
@@ -1130,7 +1130,7 @@ def configure_logging(logfile_path=None, encoding=ENCODING,
     LOGGER.setLevel(level)
 
 
-def extend_excluded(excluded, script_path, path_to_walk, excluded_relative_to,
+def extend_excluded(excluded, script_path, excluded_relative_to,
                     output_path=None, logfile_path=None):
     """Enhance path excluded list with current script name and optional
     output path.
@@ -1141,8 +1141,6 @@ def extend_excluded(excluded, script_path, path_to_walk, excluded_relative_to,
         Existing list of patterns to exclude.
     script_path : :class:`pathlib.Path`
         This current script absolute path, as called by Python.
-    path_to_walk : :class:`pathlib.Path`
-        Absolute path to walk.
     excluded_relative_to : :class:`pathlib.Path`
         Absolute path from which relative excluded one will be relative to.
     output_path : :class:`pathlib.Path`
@@ -1203,11 +1201,14 @@ def prepare_options(app_run_infos, parsed_cli_args):
         Application configuration.
     """
     # Parse and adjust options
-    path = "." if (parsed_cli_args.path is None) else parsed_cli_args.path
-    try:
-        path_to_walk = Path(path).resolve(strict=True)
-    except FileNotFoundError as error:
-        exit_on_error(f"Unable to reach ``{path}`` path to walk on it!")
+    pathes = ["."] if (parsed_cli_args.pathes is None) \
+                   else parsed_cli_args.pathes
+    pathes_to_walk = []
+    for path in pathes:
+        try:
+            pathes_to_walk.append(Path(path).resolve(strict=True))
+        except FileNotFoundError as error:
+            exit_on_error(f"Unable to reach ``{path}`` path to walk on it!")
 
     #   nodes' pathes relative to
     pathes_relative_to = None
@@ -1217,7 +1218,12 @@ def prepare_options(app_run_infos, parsed_cli_args):
         if _pathes_relative_to == "<HOME>":
             pathes_relative_to = Path.home()
         elif _pathes_relative_to == "<WALKED>":
-            pathes_relative_to = path_to_walk
+            if len(pathes_to_walk) > 1:
+                exit_on_error((f"--pathes-relative-to option could only be "
+                               f"set to ``<WALKED>`` if there is only one "
+                               f"path to be walked; currently, "
+                               f"{len(pathes_to_walk)} are set!"))
+            pathes_relative_to = pathes_to_walk[0]
         else:
             pathes_relative_to = Path(_pathes_relative_to).resolve()
         if not pathes_relative_to.exists():
@@ -1241,7 +1247,6 @@ def prepare_options(app_run_infos, parsed_cli_args):
                 f"CLI option `--log` could only be used with no value if "
                 f"``--output`` is already set, as value of logfile path will "
                 f"be derived from value of output path!"))
-
         ext_length = len("".join(output_path.suffixes))
         now = datetime.now().strftime("%Y%m%d-%H%M%S")
         logfile_path_prefix = str(output_path)[:-ext_length]
@@ -1257,7 +1262,12 @@ def prepare_options(app_run_infos, parsed_cli_args):
     if _excluded_relative_to == "<HOME>":
         excluded_relative_to = Path.home()
     elif _excluded_relative_to == "<WALKED>":
-        excluded_relative_to = path_to_walk
+        if len(pathes_to_walk) > 1:
+            exit_on_error((f"--excluded-relative-to option could only be "
+                           f"set to ``<WALKED>`` if there is only one path to "
+                           f"be walked; currently, {len(pathes_to_walk)} are "
+                           f"set!"))
+        excluded_relative_to = pathes_to_walk[0]
     else:
         excluded_relative_to = Path(_excluded_relative_to).resolve()
 
@@ -1265,13 +1275,12 @@ def prepare_options(app_run_infos, parsed_cli_args):
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
     excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
-                               path_to_walk=path_to_walk,
                                excluded_relative_to=excluded_relative_to,
                                output_path=output_path,
                                logfile_path=logfile_path)
 
     # Return application options container
-    return Options(parsed_cli_args, path_to_walk,
+    return Options(parsed_cli_args, pathes_to_walk,
                    sleep_time=parsed_cli_args.sleep,
                    pathes_relative_to=pathes_relative_to,
                    output_path=output_path, logfile_path=logfile_path,
@@ -1294,7 +1303,9 @@ def log_infos(app_run_infos, options):
     LOGGER.info(f"- current working directory: {app_run_infos.working_dirpath}")
     LOGGER.info(f"- process id (pid): {app_run_infos.pid}")
     LOGGER.info(f"- start date/time: {app_run_infos.start_datetime_as_isoformat}")
-    LOGGER.info(f"Will scan `{options.root_path_walked}`...")
+    LOGGER.info("Will scan following pathes:")
+    for path in options.walked_pathes:
+        LOGGER.info(f"- `{path}`")
     LOGGER.info("Options are set as following:")
     LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
     LOGGER.info(f"- checksum algorithm to use, if any: {options.checksum}")
@@ -1319,21 +1330,21 @@ def _main(options):
     write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
 
     #   Process node(s)
-    starting_path = options.root_path_walked
     pathes_relative_to = options.pathes_relative_to
     output_path = options.output_path
 
-    #       Case of terminal node (e.g. file):
-    if not starting_path.is_dir():
-        node_infos = process_only(starting_path, options)
-        if node_infos:
-            write_new_line(output_path, ENCODING,
-                           node_infos.tocsv(pathes_relative_to))
-    else:
-        #       Nominal case of a directory:
-        for node_infos in walk(starting_path, options):
-            write_new_line(output_path, ENCODING,
-                           node_infos.tocsv(pathes_relative_to))
+    for path in options.walked_pathes:
+        # Case of terminal node (e.g. file):
+        if not path.is_dir():
+            node_infos = process_only(path, options)
+            if node_infos:
+                write_new_line(output_path, ENCODING,
+                               node_infos.tocsv(pathes_relative_to))
+        else:
+            # Nominal case of a directory:
+            for node_infos in walk(path, options):
+                write_new_line(output_path, ENCODING,
+                               node_infos.tocsv(pathes_relative_to))
 
 
 def main():
