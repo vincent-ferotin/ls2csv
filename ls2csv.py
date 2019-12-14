@@ -36,6 +36,7 @@ from os.path import (
     join,
 )
 from pathlib import Path
+from random import uniform
 from re import (
     compile as compile_,
     escape,
@@ -150,7 +151,8 @@ DEFAULT_EXCLUDED = [
     r"admin/config/apache/run/",
 ]
 
-DEFAULT_TIME_SLEEP = 0.33
+DEFAULT_MIN_TIME_SLEEP = 0.25
+DEFAULT_MAX_TIME_SLEEP = 0.35
 
 
 # Classes  ------------------------------------------------------------------
@@ -549,12 +551,13 @@ class Options:
     """Script options.
     """
     def __init__(self, parsed_cli_args, walked_pathes,
-                 sleep_time=None,
+                 min_sleep_time=None, max_sleep_time=None,
                  pathes_relative_to=None, output_path=None, logfile_path=None,
                  excluded=None, excluded_relative_to=None, checksum=None):
         self._parsed_cli_args = parsed_cli_args
         self._walked_pathes = list(walked_pathes)
-        self._sleep_time = sleep_time
+        self._min_sleep_time = min_sleep_time
+        self._max_sleep_time = max_sleep_time
         self._pathes_relative_to = pathes_relative_to
         self._output_path = output_path
         self._logfile_path = logfile_path
@@ -573,8 +576,12 @@ class Options:
         return self._walked_pathes[:]
 
     @property
-    def sleep_time(self):
-        return self._sleep_time
+    def min_sleep_time(self):
+        return self._min_sleep_time
+
+    @property
+    def max_sleep_time(self):
+        return self._max_sleep_time
 
     @property
     def pathes_relative_to(self):
@@ -623,6 +630,17 @@ class Options:
             return Path(path)
         # else:
         return path.relative_to(self.pathes_relative_to)
+
+    def get_random_sleep_time(self):
+        """Get random sleep time, regarding interval defined by `min_sleep_time`
+        and `max_sleep_time`.
+
+        Returns
+        -------
+        `float`
+            Time to sleep (in s.).
+        """
+        return uniform(self.min_sleep_time, self.max_sleep_time)
 
 
 # Functions  ----------------------------------------------------------------
@@ -1007,7 +1025,7 @@ def walk(path_to_walk, options):
 
             if node:
                 yield node
-                sleep(options.sleep_time)
+                sleep(options.get_random_sleep_time())
 
                 if node.type == NodeType.directory:
                     yield from walk(node.path, options)
@@ -1059,10 +1077,19 @@ def create_args_parser():
                               "to. Common options are ``<HOME>`` or "
                               "``<WALKED>``, for either user's home or walked "
                               "path (if only one). Default to ``<WALKED>``."))
-    parser.add_argument('--sleep', type=float, default=DEFAULT_TIME_SLEEP,
-                        help=("Approx. time to sleep, in seconds, between "
-                              "running two successive `ls` commands on *files* "
-                              "(not directories). Could be expressed as float."))
+    parser.add_argument('--sleep',
+                        default=(
+                            f"{DEFAULT_MIN_TIME_SLEEP:.3f},"
+                            f"{DEFAULT_MAX_TIME_SLEEP:.3f}"),
+                        help=("Time interval based on which randomly sleep, "
+                              "between two concsecutive `ls` commands on "
+                              "*file* (not directories). Time values are "
+                              "expresses in seconds, with optional decimal "
+                              "parts. Default to "
+                              f"``{DEFAULT_MIN_TIME_SLEEP:.3f},"
+                              f"{DEFAULT_MAX_TIME_SLEEP:.3f}``."
+                              "If you explicitely desires no sleep time, "
+                              "option must be set to ``0,0``."))
     parser.add_argument('-o', '--output',
                         help=("Output CSV filepath where store results of "
                               "`ls` command traversing files tree. "
@@ -1200,7 +1227,23 @@ def prepare_options(app_run_infos, parsed_cli_args):
     :class:`Options`
         Application configuration.
     """
-    # Parse and adjust options
+    # Sleep time interval
+    sleep_option = parsed_cli_args.sleep
+    sleep_parts = sleep_option.split(',')
+    if len(sleep_parts) != 2:
+        exit_on_error((f"`--sleep` option must contain 2 parts separeted by a "
+                       "comma (`,`); value passed here, ``{sleep_option}``, "
+                       "contains {len(sleep_parts} parts separeted by a comma!"))
+    try:
+        min_sleep_time, max_sleep_time = float(sleep_parts[0]), float(sleep_parts[1])
+    except ValueError as error:
+        exit_on_error((f"Unable to parse given `--sleep` time interval in two "
+                       f"valid float numbers; passed values were: "
+                       f"[{sleep_parts[0]}, {sleep_parts[1]}]."))
+    if min_sleep_time > max_sleep_time:
+        min_slee_time, max_sleep_time = max_sleep_time, min_sleep_time
+
+    # Pathes to walk
     pathes = ["."] if (parsed_cli_args.pathes is None) \
                    else parsed_cli_args.pathes
     pathes_to_walk = []
@@ -1210,7 +1253,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
         except FileNotFoundError as error:
             exit_on_error(f"Unable to reach ``{path}`` path to walk on it!")
 
-    #   nodes' pathes relative to
+    # Nodes' pathes relative to
     pathes_relative_to = None
     if ('pathes_relative_to' in parsed_cli_args) \
             and (parsed_cli_args.pathes_relative_to is not None):
@@ -1230,7 +1273,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
             exit_on_error((f"Path, to which others will be relative to, "
                            f"``{pathes_relative_to}`` seems to not exists!"))
 
-    #   Manage output
+    # Manage output
     output_path = None if (('output' not in parsed_cli_args)
                             or (parsed_cli_args.output is None)) \
                        else Path(parsed_cli_args.output).resolve()
@@ -1281,7 +1324,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
 
     # Return application options container
     return Options(parsed_cli_args, pathes_to_walk,
-                   sleep_time=parsed_cli_args.sleep,
+                   min_sleep_time=min_sleep_time, max_sleep_time=max_sleep_time,
                    pathes_relative_to=pathes_relative_to,
                    output_path=output_path, logfile_path=logfile_path,
                    excluded=excluded, excluded_relative_to=excluded_relative_to,
@@ -1307,7 +1350,9 @@ def log_infos(app_run_infos, options):
     for path in options.walked_pathes:
         LOGGER.info(f"- `{path}`")
     LOGGER.info("Options are set as following:")
-    LOGGER.info(f"- sleep time (in s.): {options.sleep_time}")
+    LOGGER.info((f"- sleep time interval (in s.): "
+                 f"[{options.min_sleep_time:.3f}, "
+                 f"{options.max_sleep_time:.3f}]"))
     LOGGER.info(f"- checksum algorithm to use, if any: {options.checksum}")
     LOGGER.info(f"- set pathes relative to: `{options.pathes_relative_to}`")
     LOGGER.info(f"- output of scan file: `{options.output_path}`")
@@ -1345,6 +1390,8 @@ def _main(options):
             for node_infos in walk(path, options):
                 write_new_line(output_path, ENCODING,
                                node_infos.tocsv(pathes_relative_to))
+
+        sleep(options.get_random_sleep_time())
 
 
 def main():
