@@ -41,18 +41,30 @@ from re import (
     compile as compile_,
     escape,
 )
+from signal import (
+    SIGHUP,
+    SIGINT,
+    #SIGKILL,  # cannot be caught blocked or ignored
+    SIGPROF,
+    #SIGSTOP,  # cannot be caught blocked or ignored
+    SIGTERM,
+    SIGTSTP,
+    SIGUSR1,
+    SIGUSR2,
+    signal,
+)
 from subprocess import (
     CalledProcessError,
     PIPE,
     run,
     STDOUT,
 )
-from time import sleep
 from sys import (
     argv,
     exit,
     stderr,
 )
+from time import sleep
 
 
 # Constants  ----------------------------------------------------------------
@@ -66,6 +78,18 @@ DEFAULT_LOG_LEVEL = INFO
 DEFAULT_CHECKSUM_ALGORITHM = "md5"
 HASH_FUNCTIONS = {
     'md5': md5,
+}
+
+SIGNALS = {
+    SIGHUP:  "SIGHUP",
+    SIGINT:  "SIGINT",
+    #SIGKILL,  # cannot be caught blocked or ignored
+    SIGPROF: "SIGPROF",
+    #SIGSTOP,  # cannot be caught blocked or ignored
+    SIGTERM: "SIGTERM",
+    SIGTSTP: "SIGTSTP",
+    SIGUSR1: "SIGUSR1",
+    SIGUSR2: "SIGUSR2",
 }
 
 # `ls` command and options:
@@ -1425,9 +1449,23 @@ def log_infos(app_run_infos, options):
             LOGGER.info(f'  - ``"{excluded_pattern}"``')
 
 
+def stop_signal_handler(signal=None, frame=None):
+    """Handler for all signals terminating current application run.
+    """
+    now = datetime.now().isoformat()
+    LOGGER.critical((f"Process terminating, receiving ``{signal}`` (i.e. "
+                     f"``{SIGNALS[signal]}``) signal (or keyboard Ctrl+C "
+                     f"interrupt) at {now}!"))
+    exit(2)
+
+
 def _main(options):
     """Core function of Main function.
     """
+    # Register stop signal handler
+    for _signal in SIGNALS.keys():
+        signal(_signal, stop_signal_handler)
+
     # Walk tree and print dir. entries metadata:
     write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
 
@@ -1435,20 +1473,23 @@ def _main(options):
     pathes_relative_to = options.pathes_relative_to
     output_path = options.output_path
 
-    for path in options.walked_pathes:
-        # Case of terminal node (e.g. file):
-        if not path.is_dir():
-            node_infos = process_only(path, options)
-            if node_infos:
-                write_new_line(output_path, ENCODING,
-                               node_infos.tocsv(pathes_relative_to))
-        else:
-            # Nominal case of a directory:
-            for node_infos in walk(path, options):
-                write_new_line(output_path, ENCODING,
-                               node_infos.tocsv(pathes_relative_to))
+    try:
+        for path in options.walked_pathes:
+            # Case of terminal node (e.g. file):
+            if not path.is_dir():
+                node_infos = process_only(path, options)
+                if node_infos:
+                    write_new_line(output_path, ENCODING,
+                                   node_infos.tocsv(pathes_relative_to))
+            else:
+                # Nominal case of a directory:
+                for node_infos in walk(path, options):
+                    write_new_line(output_path, ENCODING,
+                                   node_infos.tocsv(pathes_relative_to))
 
-        sleep(options.get_random_sleep_time())
+            sleep(options.get_random_sleep_time())
+    except KeyboardInterrupt as error:
+        stop_signal_handler()
 
 
 def main():
