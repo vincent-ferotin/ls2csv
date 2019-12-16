@@ -196,6 +196,12 @@ class OwnerType(Enum):
     other = 3
 
 
+DirEntries = namedtuple('DirEntries', (
+    'directories',
+    'files',
+    'links'))
+
+
 class NodeInfos:
     """Metadata about a filesystem node.
     """
@@ -968,6 +974,36 @@ def get_node_infos(path, dir_entry):
                      error_msgs=error_msgs)
 
 
+def _scandir(dirpath):
+    """Scan a given directory and sort its entries by types and names.
+
+    Arguments
+    ---------
+    dirpath : `pathlib.Path`
+        Directory path to scan.
+
+    Returns
+    -------
+    :class:`DirEntries`
+        Directory entries, sorted by types and names.
+    """
+    _dirs, _files, _links = ([], [], [])
+    with scandir(dirpath) as dir_entries:
+        for dir_entry in dir_entries:
+            if dir_entry.is_symlink():
+                _links.append(dir_entry)
+            elif dir_entry.is_dir(follow_symlinks=False):
+                _dirs.append(dir_entry)
+            elif dir_entry.is_file(follow_symlinks=False):
+                _files.append(dir_entry)
+
+    _dirs = sorted(_dirs, key=lambda entry: entry.name)
+    _files = sorted(_files, key=lambda entry: entry.name)
+    _links = sorted(_links, key=lambda entry: entry.name)
+
+    return DirEntries(_dirs, _files, _links)
+
+
 def process(parent_dirpath, dir_entry, options):
     """Process some node's path.
 
@@ -1001,12 +1037,17 @@ def process(parent_dirpath, dir_entry, options):
     return node_infos
 
 
-def walk(path_to_walk, options):
-    """Walk a given path.
+def walk(dir_path, options):
+    """Walk a given directory path.
+
+    Entries in path are walked in this order:
+
+    #.  by their types first: files first, then symlinks, then directories;
+    #.  by their names then.
 
     Arguments
     ---------
-    path_to_walk : `pathlib.Path`
+    dir_path : `pathlib.Path`
         Directory path to walk.
     optins : :class:`Options`
         Current application options.
@@ -1017,18 +1058,27 @@ def walk(path_to_walk, options):
         List of output of shell command `ls` on walked paths as constructed
         `Node` instances.
     """
-    LOGGER.info((f"  Start scanning `{options.get_path(path_to_walk)}/` "
+    LOGGER.info((f"  Start scanning `{options.get_path(dir_path)}/` "
                  "directory..."))
-    with scandir(path_to_walk) as dir_entries:
-        for dir_entry in dir_entries:
-            node = process(path_to_walk, dir_entry, options)
 
-            if node:
-                yield node
-                sleep(options.get_random_sleep_time())
+    _dir_entries = _scandir(dir_path)
+    dir_entries, file_entries, link_entries = \
+        _dir_entries.directories, _dir_entries.files, _dir_entries.links
 
-                if node.type == NodeType.directory:
-                    yield from walk(node.path, options)
+    for node_entry in (file_entries + link_entries):
+        node = process(dir_path, node_entry, options)
+
+        if node:
+            yield node
+            sleep(options.get_random_sleep_time())
+
+    for dir_entry in dir_entries:
+        node = process(dir_path, dir_entry, options)
+
+        if node:
+            yield node
+            sleep(options.get_random_sleep_time())
+            yield from walk(node.path, options)
 
 
 def process_only(node_path, options):
