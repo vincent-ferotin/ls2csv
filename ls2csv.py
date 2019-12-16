@@ -183,7 +183,7 @@ DEFAULT_MAX_TIME_SLEEP = 0.35
 
 @unique
 class NodeType(Enum):
-    error = 0
+    other = 0
     directory = 1
     file = 2
     symlink = 3
@@ -417,6 +417,9 @@ class NodeInfos:
         """
         return self._checksums.get(algorithm)
 
+    def has_error(self):
+        return len(self._error_msgs) != 0
+
     @property
     def error_msgs(self):
         return " | ".join(self._error_msgs)
@@ -429,6 +432,7 @@ class NodeInfos:
         return tocsv([
             "Path",
             "Type",
+            "Has error(s)",
             "Links nb.",
             "Size (b)",
             "Size (-h)",
@@ -452,6 +456,7 @@ class NodeInfos:
         return tocsv([
             self.get_path(relative_to=pathes_relative_to),
             self.type,
+            None if (not self.has_error()) else "ERROR",
             self.links_nb,
             self.size.value,
             self.size.convert_to(),
@@ -882,7 +887,7 @@ def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
         reading its content was possible; ``None`` otherwise.
     """
     type_ = node_infos.type
-    if (type_ == NodeType.error) or (type_ != NodeType.file):
+    if type_ != NodeType.file:  # FIXME: also: "or not .exists()"
         return None
     # else:
 
@@ -913,7 +918,7 @@ def get_node_infos(path, dir_entry):
     NodeInfos
         Informations about node located at :param:`path`.
     """
-    symlinked_path, symlink_type = (None,) * 2
+    type_, symlinked_path, symlink_type = (None,) * 3
     error_msgs = []
 
     # type
@@ -932,17 +937,23 @@ def get_node_infos(path, dir_entry):
         else:
             error_msg = \
                 f"Path ``{path}`` is neither a directory, a file or a symlink!"
-            return NodeInfos(path, NodeType.error, error_msgs=error_msg)
+            return NodeInfos(path, NodeType.other,
+                             symlink=symlinked_path, symlink_type=symlink_type,
+                             error_msgs=error_msg)
     except PermissionError as error:
         error_msg = (
             f"Path ``{path}`` is unreachable, asking for its type results in "
             f"a permission error: {error.strerror}")
-        return NodeInfos(path, NodeType.error, error_msgs=error_msg)
+        return NodeInfos(path, type_,
+                         symlink=symlinked_path, symlink_type=symlink_type,
+                         error_msgs=error_msg)
     except OSError as error:
         error_msg = (
             f"Checking for ``{path}`` type results in an OSError: "
             f"{error.strerror}")
-        return NodeInfos(path, NodeType.error, error_msgs=error_msg)
+        return NodeInfos(path, type_,
+                         symlink=symlinked_path, symlink_type=symlink_type,
+                         error_msgs=error_msg)
 
     # ls
     try:
@@ -953,12 +964,16 @@ def get_node_infos(path, dir_entry):
         output = completed_process.stdout.rstrip()
     except CalledProcessError as error:
         error_msgs.append(f"Failed to run `ls` on ``{path}``: {error.stderr}")
-        return NodeInfos(path, NodeType.error, error_msgs=error_msgs)
+        return NodeInfos(path, type_,
+                         symlink=symlinked_path, symlink_type=symlink_type,
+                         error_msgs=error_msgs)
 
     match = LS_OUTPUT_REGEX.match(output)
     if match is None:
         error_msgs.append(f"Unable to parse output of `ls` command: ``{output}``")
-        return NodeInfos(path, NodeType.error, error_msgs=error_msgs)
+        return NodeInfos(path, type_,
+                         symlink=symlinked_path, symlink_type=symlink_type,
+                         error_msgs=error_msgs)
     # else:
 
     # retrieve property values from parsed regexp
@@ -971,17 +986,15 @@ def get_node_infos(path, dir_entry):
     links_nb = int(links_nb)
     size = int(size)
 
-    atime, mtime, ctime = (None,) * 3
-
     # Check if types are coherents
     if p_type != type_.as_ls_output_char():
         error_msg = (
             f"Types differ from Python :mod:`os.scandir` result and output of "
             f"`ls` command: ``{type_}`` (Python) != ``{p_type}`` (ls)!")
         error_msgs.append(error_msg)
-        return NodeInfos(path, NodeType.error, error_msgs=error_msgs)
 
     # Get (a|m|c)time(s)
+    atime, mtime, ctime = (None,) * 3
     try:
         atime = getatime(path)
         mtime = getmtime(path)
