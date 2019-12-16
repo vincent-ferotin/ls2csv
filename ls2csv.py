@@ -1065,6 +1065,7 @@ def walk(dir_path, options):
     dir_entries, file_entries, link_entries = \
         _dir_entries.directories, _dir_entries.files, _dir_entries.links
 
+    # Scan files first, then symlinks
     for node_entry in (file_entries + link_entries):
         node = process(dir_path, node_entry, options)
 
@@ -1072,13 +1073,19 @@ def walk(dir_path, options):
             yield node
             sleep(options.get_random_sleep_time())
 
+    # Scan directories then
+    subdir_nodes = []
     for dir_entry in dir_entries:
         node = process(dir_path, dir_entry, options)
 
         if node:
+            subdir_nodes.append(node)
             yield node
             sleep(options.get_random_sleep_time())
-            yield from walk(node.path, options)
+
+    # Last, recursively walk inside each subdirectory nodes
+    for subdir_node in subdir_nodes:
+        yield from walk(subdir_node.path, options)
 
 
 def process_only(node_path, options):
