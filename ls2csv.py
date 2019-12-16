@@ -8,6 +8,7 @@ from enum import (
     Enum,
     unique,
 )
+from errno import ENOENT
 from datetime import datetime
 from hashlib import md5
 from logging import (
@@ -23,9 +24,9 @@ from os import (
     getpid,
     readlink,
     scandir,
+    strerror,
 )
 from os.path import (
-    exists,
     getatime,
     getctime,
     getmtime,
@@ -74,6 +75,8 @@ SCRIPT_DESC = "Custom version of `ls` output in results in CSV format."
 
 LOGGER = getLogger(__name__)
 
+APP_RUN_INFOS = None
+
 DEFAULT_LOG_LEVEL = INFO
 
 DEFAULT_CHECKSUM_ALGORITHM = "md5"
@@ -112,7 +115,7 @@ LSD = "ls -A -l -Q -Z --time-style=long-iso -d \"{path}\""
 LS_OUTPUT_REGEX = compile_(''
     r'^'
     # Type
-    r'(?P<p_type>l|d|r|-)'
+    r'(?P<p_type>[-ldrMnpscbD?]{1})'
     # Permissions
     r'(?P<p_perms>((r|-)(w|-)(x|X|s|t|S|T|-)){3})'
     r'\s+'
@@ -188,6 +191,8 @@ class NodeType(Enum):
     directory = 1
     file = 2
     symlink = 3
+    unknown = 4
+    excluded = 5
 
     def as_ls_output_char(self):
         equivalence = {
@@ -195,23 +200,18 @@ class NodeType(Enum):
             NodeType.directory: "d",
             NodeType.symlink: "l"
         }
-        return equivalence[self]
+        return equivalence.get(self, "?")
 
 
 @unique
 class SymLinkType(Enum):
-    error = 0
+    other = 0
     directory = 1
     file = 2
     symlink = 3
+    unknown = 4
     broken = 5
-
-
-PossibleSymLink = namedtuple('PossibleSymLink', (
-    'path',
-    'link_type',
-    'linked_path',
-    'error_msg'))
+    circular = 6
 
 
 @unique
@@ -224,85 +224,91 @@ class OwnerType(Enum):
 DirEntries = namedtuple('DirEntries', (
     'directories',
     'files',
-    'links'))
+    'links',
+    'excluded',
+    'unknowns'))
 
 
-class NodeInfos:
-    """Metadata about a filesystem node.
+class Result:
+    """Container for either a value (result of function call) or an error.
     """
-    def __init__(self, path, type_,
-                 links_nb=None, size=None,
-                 perms=None, user_owner=None, group_owner=None, security=None,
-                 atime=None, mtime=None, ctime=None,
-                 symlink=None, symlink_type=None, checksums=None,
-                 error_msgs=None):
-        self._path = Path(path) if isinstance(path, str) else path
-        self._type = type_
-        self._links_nb = links_nb
-        if isinstance(size, int):
-            size = Size(size)
-        self._size = size
-        self._perms = perms
-        self._user_owner = user_owner
-        self._group_owner = group_owner
-        self._security = security
-        self._atime = None
-        if atime:
-            if isinstance(atime, float):
-                self._atime = datetime.fromtimestamp(atime)
-            elif isinstance(atime, datetime):
-                self._atime = atime
-        self._mtime = None
-        if mtime:
-            if isinstance(mtime, float):
-                self._mtime = datetime.fromtimestamp(mtime)
-            elif isinstance(mtime, datetime):
-                self._mtime = mtime
-        self._ctime = None
-        if ctime:
-            if isinstance(ctime, float):
-                self._ctime = datetime.fromtimestamp(ctime)
-            elif isinstance(ctime, datetime):
-                self._ctime = ctime
-        self._symlink = Path(symlink) if isinstance(symlink, str) else symlink
-        self._symlink_type = symlink_type
-        self._checksums = dict()
-        if checksums:
-            self._checksums.update(checksums)
+    def __init__(self, value=None, error_msg=None):
+        self._value = value
+        self._error_msg = error_msg
 
-        self._error_msgs = []
-        if error_msgs:
-            if isinstance(error_msgs, str):
-                self._error_msgs.append(error_msgs)
-            else:  # assume iterable
-                self._error_msgs.extend([msg for msg in error_msgs])
+    @property
+    def value(self):
+        return self._value
+
+    @property
+    def error_msg(self):
+        return self._error_msg
+
+    def has_value(self):
+        return self._value is not None
+
+    def has_error(self):
+        return self._error_msg is not None
+
+
+class DirEntry:
+    """Wrapper class around :class:`os.DirEntry`.
+    """
+    def __init__(self, parent_dirpath, entry, options, type_=None):
+        self._path = parent_dirpath / fsdecode(entry.name)
+        self._entry = entry
+        self.set_type(options, type_)
 
     @property
     def path(self):
-        if self._path is None:
-            return None
-        # else:
         return Path(self._path)
-
-    def get_path(self, relative_to=None):
-        if self._path is None:
-            return None
-        # else:
-        if relative_to is None:
-            return self.path
-        # else:
-        try:
-            _path = self._path.relative_to(relative_to)
-        except ValueError as error:
-            _path = self._path
-        return str(_path)
 
     def is_path_existing(self):
         return lexists(self._path)
 
     @property
+    def name(self):
+        return self._entry.name
+
+    @property
+    def entry(self):
+        return self._entry
+
+    @property
     def type(self):
-        return self._type
+        if self._type:
+            return self._type
+        # else: default: unknown
+        return NodeType.unknown
+
+    def set_type(self, options, type_=None):
+        # Test if node's path must be excluded
+        if options.is_path_excluded(self._path):
+            self._type = NodeType.excluded
+            return
+        # else:
+
+        # Set type if any
+        if type_:
+            self._type = type_
+            return
+        # else:
+
+        # Try inferring type from dir_entry
+        dir_entry = self._entry
+        try:
+            if dir_entry.is_symlink():
+                type_ = NodeType.symlink
+            elif dir_entry.is_dir(follow_symlinks=False):
+                type_ = NodeType.directory
+            elif dir_entry.is_file(follow_symlinks=False):
+                type_ = NodeType.file
+            else:
+                type_ = NodeType.unknown
+        except OSError as error:
+            type_ = NodeType.unknown
+
+        self._type = type_
 
     def is_dir(self):
         return self._type == NodeType.directory
@@ -313,186 +319,109 @@ class NodeInfos:
     def is_symlink(self):
         return self._type == NodeType.symlink
 
-    @property
-    def links_nb(self):
-        return self._links_nb
+    def is_type_unknown(self):
+        return self.type == NodeType.unknown
 
-    @property
-    def size(self):
-        return self._size
+    def is_excluded(self):
+        return self._type == NodeType.excluded
 
-    @property
-    def perms(self):  # TODO: param: OwnerType
-        return self._perms
-
-    @property
-    def user_owner(self):
-        return self._user_owner
-
-    @property
-    def group_owner(self):
-        return self._group_owner
-
-    @property
-    def security(self):
-        return self._security
-
-    @property
-    def mtime(self):
-        return self._mtime
-
-    @property
-    def mtime_as_timestamp(self):
-        return None if (self._mtime is None) else self._mtime.timestamp()
-
-    @property
-    def mtime_as_isoformat(self):
-        return None if (self._mtime is None) else self._mtime.isoformat()
-
-    @property
-    def atime(self):
-        return self._atime
-
-    @property
-    def atime_as_timestamp(self):
-        return None if (self._atime is None) else self._atime.timestamp()
-
-    @property
-    def atime_as_isoformat(self):
-        return None if (self._atime is None) else self._atime.isoformat()
-
-    @property
-    def ctime(self):
-        return self._ctime
-
-    @property
-    def ctime_as_timestamp(self):
-        return None if (self._ctime is None) else self._ctime.timestamp()
-
-    @property
-    def ctime_as_isoformat(self):
-        return None if (self._ctime is None) else self._ctime.isoformat()
-
-    @property
-    def symlink(self):
-        if self._symlink is None:
-            return None
-        # else:
-        return str(self._symlink)
-
-    def get_symlink(self, relative_to=None):
-        if self._symlink is None:
-            return None
-        # else:
-        if relative_to is None:
-            return self.symlink
-        # else:
-        try:
-            _symlink = self._symlink.relative_to(relative_to)
-        except ValueError as error:
-            _symlink = self._symlink
-        return str(_symlink)
-
-    @property
-    def symlink_type(self):
-        return self._symlink_type
-
-    @property
-    def checksums(self):
-        return self._checksums.copy()
-
-    def add_checksum(self, algorithm, checksum):
-        """Add a checksum to checksums collection.
+    @classmethod
+    def new_entry_from_path(cls, path, options):
+        """Create a new DirEntry from a given path.
 
         Arguments
         ---------
-        algorithm : `str`
-            Algorithm used for generating :param:`checksum`.
-        checksum : `str`
-            Hexadecimal digest of checksum of current node's content with
-            :param:`algorithm`.
-        """
-        self._checksums[algorithm] = checksum
+        path : `pathlib.Path`
+            Absolute and resolved and existing path to transform into
+            a new entry.
+        options : :class:`Options`
+            Current application options.
 
-    def get_checksum(self, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
-        """Get current checksum for a given algorithm.
-
-        Arguments
-        ---------
-        algorithm : `str`
-            Algorithm used for generating desired checksum.
+        Raises
+        ------
+        `OSError`
+            If OS encounters some problem scanning parent directory
+            with `os.scandir()`.
+        `FileNotFoundError`
+            If current path is no more a valid parent's entry.
 
         Returns
         -------
-        `str` or ``None``
-            Hexadecimal digest of checksum of current node's content with
-            :param:`algorithm`.
+        :class:`DirEntry`
+            New dir. entry corresponding to :param:`path`.
         """
-        return self._checksums.get(algorithm)
+        parent_dirpath = path.parent
+        name = path.name
+        not_found = False
 
-    def has_error(self):
-        return len(self._error_msgs) != 0
+        try:
+            with scandir(parent_dirpath) as dir_entries:
+                for dir_entry in dir_entries:
+                    if dir_entry.name == name:
+                        return cls(parent_dirpath, dir_entry, options)
+                not_found = True
+        except OSError as error:
+            LOGGER.error((
+                f"Failed to run `os.scandir()` on ``{parent_dirpath}`` path! "
+                f"Get following error message: {error.strerror}"))
+            raise error
+
+        # We should normaly never reach this section!
+        if not_found:
+            error_msg = (
+                f"`{name}` was not found amongst parent directory path "
+                f"``{parent_dirpath}``! This could occurs if child entry or "
+                f"its parent were deleted between the first time child path "
+                f"was checked as existing and now, when scanning its parent...")
+            # See https://stackoverflow.com/questions/36077266/how-do-i-raise-a-filenotfounderror-properly
+            raise FileNotFoundError(ENOENT,
+                                    (strerror(ENOENT) + " " + error_msg),
+                                    path)
+
+
+class SymLink:
+    """Container for symbolic link infos.
+    """
+    def __init__(self, type_, linked_path=None, resolved_linked_path=None):
+        self._type = type_
+        self._linked_path = linked_path
+        self._resolved_linked_path = resolved_linked_path
 
     @property
-    def error_msgs(self):
-        return " | ".join(self._error_msgs)
+    def type(self):
+        return self._type
 
-    def add_error_msg(self, new_error_msg):
-        self._error_msgs.append(new_error_msg)
+    def is_linked_path_dir(self):
+        return self._type == SymLinkType.directory
 
-    @staticmethod
-    def colstocsv():
-        return tocsv([
-            "Path",
-            "Type",
-            "Has error(s)",
-            "Links nb.",
-            "Size (b)",
-            "Size (-h)",
-            "Permissions",
-            "User owner",
-            "Group owner",
-            "Security infos.",
-            "atime (last access, in s. since Epoch)",
-            "atime (ISO 8601 format)",
-            "mtime (last mod., in s. since Epoch)",
-            "atime (ISO 8601 format)",
-            "ctime (last metada change, in s. since Epoch)",
-            "ctime (ISO 8601 format)",
-            "Sym.Link to path",
-            "Type of Sym.Link",
-            "MD5 checksum",
-            "Error message(s)",
-        ])
+    def is_linked_path_file(self):
+        return self._type == SymLinkType.file
 
-    def tocsv(self, pathes_relative_to=None):
-        return tocsv([
-            self.get_path(relative_to=pathes_relative_to),
-            self.type,
-            None if (not self.has_error()) else "ERROR",
-            self.links_nb,
-            self.size.value,
-            self.size.convert_to(),
-            self.perms,
-            self.user_owner,
-            self.group_owner,
-            self.security,
-            self.atime_as_timestamp,
-            self.atime_as_isoformat,
-            self.mtime_as_timestamp,
-            self.mtime_as_isoformat,
-            self.ctime_as_timestamp,
-            self.ctime_as_isoformat,
-            self.get_symlink(relative_to=pathes_relative_to),
-            self.symlink_type,
-            self.get_checksum('md5'),
-            self.error_msgs,
-        ])
+    def is_linked_path_symlink(self):
+        return self._type == SymLinkType.symlink
 
+    def is_linked_path_unknown(self):
+        return self._type == SymLinkType.unknown
 
-FileContent = namedtuple('FileContent', (
-    'content',
-    'error_msg'))
+    def is_broken(self):
+        return self._type == SymLinkType.broken
+
+    def is_circular(self):
+        return self._type == SymLinkType.circular
+
+    @property
+    def linked_path(self):
+        if self._linked_path:
+            Path(self._linked_path)
+        # else:
+        return None
+
+    @property
+    def resolved_linked_path(self):
+        if self._resolved_linked_path:
+            Path(self._resolved_linked_path)
+        # else:
+        return None
 
 
 class Size:
@@ -565,6 +494,347 @@ class Size:
         return f"{_size:.1f} {_unit}"
 
 
+class NodeInfos:
+    """Metadata about a filesystem node.
+    """
+    def __init__(self, path, type_,
+                 links_nb=None, size=None,
+                 perms=None, user_owner=None, group_owner=None, security=None,
+                 atime=None, mtime=None, ctime=None,
+                 symlink_type=None, symlink_value=None, resolved_symlink_path=None,
+                 checksums=None, error_msgs=None, ls_output=None):
+        self._path = Path(path) if isinstance(path, str) else path
+        self._type = type_
+        self._links_nb = links_nb
+        if isinstance(size, int):
+            size = Size(size)
+        self._size = size
+        self._perms = perms
+        self._user_owner = user_owner
+        self._group_owner = group_owner
+        self._security = security
+        self._atime = None
+        if atime:
+            if isinstance(atime, float):
+                self._atime = datetime.fromtimestamp(atime)
+            elif isinstance(atime, datetime):
+                self._atime = atime
+        self._mtime = None
+        if mtime:
+            if isinstance(mtime, float):
+                self._mtime = datetime.fromtimestamp(mtime)
+            elif isinstance(mtime, datetime):
+                self._mtime = mtime
+        self._ctime = None
+        if ctime:
+            if isinstance(ctime, float):
+                self._ctime = datetime.fromtimestamp(ctime)
+            elif isinstance(ctime, datetime):
+                self._ctime = ctime
+        self._symlink_type = symlink_type
+        self._symlink_value = \
+            Path(symlink_value) if isinstance(symlink_value, str) \
+                                else symlink_value
+        self._resolved_symlink_path = \
+            Path(resolved_symlink_path) if isinstance(resolved_symlink_path, str) \
+                                        else resolved_symlink_path
+        self._checksums = dict()
+        if checksums:
+            self._checksums.update(checksums)
+
+        self._error_msgs = []
+        if error_msgs:
+            if isinstance(error_msgs, str):
+                self._error_msgs.append(error_msgs)
+            else:  # assume iterable
+                self._error_msgs.extend([msg for msg in error_msgs])
+        self._ls_output = ls_output
+
+    @property
+    def path(self):
+        if self._path:
+            return Path(self._path)
+        # else:
+        return None
+
+    def get_path(self, relative_to=None):
+        if self._path is None:
+            return None
+        # else:
+        if relative_to is None:
+            return self.path
+        # else:
+        try:
+            _path = self._path.relative_to(relative_to)
+        except ValueError as error:
+            _path = self._path
+        return str(_path)
+
+    def is_path_existing(self):
+        return lexists(self._path)
+
+    @property
+    def type(self):
+        if self._type:
+            return self._type
+        # else: default: unknown
+        return NodeType.unknown
+
+    @property
+    def ls_output(self):
+        return self._ls_output
+
+    def is_dir(self):
+        return self._type == NodeType.directory
+
+    def is_file(self):
+        return self._type == NodeType.file
+
+    def is_symlink(self):
+        return self._type == NodeType.symlink
+
+    def is_type_unknown(self):
+        return self.type == NodeType.unknown
+
+    def is_excluded(self):
+        return self._type == NodeType.excluded
+
+    @property
+    def links_nb(self):
+        return self._links_nb
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def size_value(self):
+        if self._size:
+            return self._size.value
+        # else:
+        return None
+
+    def size_value_converted_to(self, unit=None):
+        """Convert a given size in bytes into either human or in a given unit.
+
+        Arguments
+        ---------
+        unit : `str`
+            One of `.UNITS`.
+            If set to ``None`` (default), try to operate a conversion like
+            a human  would do.
+
+        Returns
+        -------
+        `str` or ``None``
+            Size object representation into :param:`unit` unit.
+        """
+        if self._size:
+            return self._size.convert_to(unit)
+        # else:
+        return None
+
+    @property
+    def perms(self):  # TODO: param: OwnerType
+        return self._perms
+
+    @property
+    def user_owner(self):
+        return self._user_owner
+
+    @property
+    def group_owner(self):
+        return self._group_owner
+
+    @property
+    def security(self):
+        return self._security
+
+    @property
+    def mtime(self):
+        return self._mtime
+
+    @property
+    def mtime_as_timestamp(self):
+        if self._mtime:
+            return self._mtime.timestamp()
+        # else:
+        return None
+
+    @property
+    def mtime_as_isoformat(self):
+        if self._mtime:
+            return self._mtime.isoformat(' ')
+        # else:
+        return None
+
+    @property
+    def atime(self):
+        return self._atime
+
+    @property
+    def atime_as_timestamp(self):
+        if self._atime:
+            return self._atime.timestamp()
+        # else:
+        return None
+
+    @property
+    def atime_as_isoformat(self):
+        if self._atime:
+            return self._atime.isoformat(' ')
+        # else:
+        return None
+
+    @property
+    def ctime(self):
+        return self._ctime
+
+    @property
+    def ctime_as_timestamp(self):
+        if self._ctime:
+            return self._ctime.timestamp()
+        # else:
+        return None
+
+    @property
+    def ctime_as_isoformat(self):
+        if self._ctime:
+            return self._ctime.isoformat(' ')
+        # else:
+        return None
+
+    @property
+    def symlink_value(self):
+        if self._symlink_value:
+            return Path(self._symlink_value)
+        # else:
+        return None
+
+    def get_symlink_value(self, relative_to=None):
+        if relative_to is None:
+            return self.symlink_value
+        # else:
+        if self._symlink_value:
+            try:
+                return self._symlink_value.relative_to(relative_to)
+            except ValueError as error:
+                return None
+        # else:
+        return None
+
+    @property
+    def symlink_type(self):
+        return self._symlink_type
+
+    @property
+    def resolved_symlink_path(self):
+        if self._resolved_symlink_path:
+            return Path(self._resolved_symlink_path)
+        # else:
+        return None
+
+    @property
+    def checksums(self):
+        return self._checksums.copy()
+
+    def add_checksum(self, algorithm, checksum):
+        """Add a checksum to checksums collection.
+
+        Arguments
+        ---------
+        algorithm : `str`
+            Algorithm used for generating :param:`checksum`.
+        checksum : `str`
+            Hexadecimal digest of checksum of current node's content with
+            :param:`algorithm`.
+        """
+        self._checksums[algorithm] = checksum
+
+    def get_checksum(self, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
+        """Get current checksum for a given algorithm.
+
+        Arguments
+        ---------
+        algorithm : `str`
+            Algorithm used for generating desired checksum.
+
+        Returns
+        -------
+        `str` or ``None``
+            Hexadecimal digest of checksum of current node's content with
+            :param:`algorithm`.
+        """
+        return self._checksums.get(algorithm)
+
+    def has_error(self):
+        return len(self._error_msgs) != 0
+
+    @property
+    def error_msgs(self):
+        return " | ".join(self._error_msgs)
+
+    def add_error_msg(self, new_error_msg):
+        self._error_msgs.append(new_error_msg)
+
+    @property
+    def ls_output(self):
+        return self._ls_output
+
+    @staticmethod
+    def colstocsv():
+        return tocsv([
+            "Path",
+            "Type",
+            "Has error(s)",
+            "Links nb.",
+            "Size (b)",
+            "Size (-h)",
+            "Permissions",
+            "User owner",
+            "Group owner",
+            "Security infos.",
+            "atime (last access, in s. since Epoch)",
+            "atime (ISO 8601 format)",
+            "mtime (last mod., in s. since Epoch)",
+            "atime (ISO 8601 format)",
+            "ctime (last metada change, in s. since Epoch)",
+            "ctime (ISO 8601 format)",
+            "Sym.link value",
+            "Type of sym.link",
+            "Fully resolved sym.link path",
+            "MD5 checksum",
+            "Error message(s)",
+            "Unparsed 'ls' output",
+        ])
+
+    def tocsv(self, pathes_relative_to=None):
+        return tocsv([
+            self.get_path(relative_to=pathes_relative_to),
+            self.type,
+            None if (not self.has_error()) else "ERROR",
+            self.links_nb,
+            self.size_value,
+            self.size_value_converted_to(),
+            self.perms,
+            self.user_owner,
+            self.group_owner,
+            self.security,
+            self.atime_as_timestamp,
+            self.atime_as_isoformat,
+            self.mtime_as_timestamp,
+            self.mtime_as_isoformat,
+            self.ctime_as_timestamp,
+            self.ctime_as_isoformat,
+            self.get_symlink_value(relative_to=pathes_relative_to),
+            self.symlink_type,
+            self.resolved_symlink_path,
+            self.get_checksum('md5'),
+            self.error_msgs,
+            self.ls_output,
+        ])
+
+
 class AppRunInfos:
     """Set of informations about current application run.
     """
@@ -592,7 +862,7 @@ class AppRunInfos:
 
     @property
     def start_datetime_as_isoformat(self):
-        return self._start_datetime.isoformat()
+        return self._start_datetime.isoformat(' ')
 
 
 class Options:
@@ -690,21 +960,47 @@ class Options:
         """
         return uniform(self.min_sleep_time, self.max_sleep_time)
 
+    def is_path_excluded(self, path):
+        """Tell if a given path match any of all regex patterns.
 
-# Functions  ----------------------------------------------------------------
+        Arguments
+        ---------
+        path : `pathlib.Path`
+            Directory or file path to test again list of regexp patterns.
 
-def exit_on_error(msg, return_code=1):
-    """Exit system on error.
+        Returns
+        -------
+        `bool`
+            ``True`` if at least one pattern in :param:`regex_patterns`
+            *matches* :param:`path`; ``False`` otherwise (if none pattern
+            match path).
+        """
+        path = str(path)
+        for pattern in self._excluded:
+            match = pattern.match(path)
+            if match:
+                return True
+        return False
+
+
+# CSV Functions  ------------------------------------------------------------
+
+def csv_escape(string_value):
+    """Escape a string value for CSV encoding.
 
     Arguments
     ---------
-    msg : `str`
-        Error message to print to `sys.stderr`.
-    return_code : `int`
-        Return code.
+    string_value : `str`
+        String value to escape for its encoding into CSV.
+
+    Returns
+    -------
+    `str`
+        Escaped translation of :param:`string_value`.
     """
-    print(msg, file=stderr)
-    exit(return_code)
+    return string_value.translate({
+                '"': '""',
+                })
 
 
 def tocsv(row):
@@ -723,75 +1019,18 @@ def tocsv(row):
     for item in row:
         if item is None:
             _row.append("")
-        elif isinstance(item, (int, float, bool)):
-            _row.append(str(item))
-        elif isinstance(item, str):
-            item = item.strip()\
-                       .strip('"')\
-                       .replace('"', r'\"')
-            _row.append(f'"{item}"' if (len(item) > 0) else "")
         elif isinstance(item, Enum):
             _row.append(f'"{item.name}"')
-        else:  # generic
-            item = str(item)\
-                       .strip('"')\
-                       .replace('"', r'\"')
+        elif isinstance(item, (int, float, bool)):
+            _row.append(str(item))
+        else:
+            item = csv_escape(str(item))
             _row.append(f'"{item}"' if (len(item) > 0) else "")
 
     return ",".join(_row)
 
 
-def write_new_line(filepath=None, encoding=None, content=None):
-    """Write new line with content at end of given file.
-
-    Arguments
-    ---------
-    filepath : `str`
-        Filepath into which append content; if set to ``None``, output
-        will be `sys.stdout`.
-    encoding : `str`
-        Encoding of :param:`file` if not `sys.stdout`.
-    content : `str`
-        Content to append as new line in :param:`file`.
-    """
-    if content is None:
-        return
-    #else:
-
-    if filepath is None:
-        print(content)
-        return
-    #else:
-
-    with open(filepath, mode='at', encoding=encoding) as file_:
-        file_.write(content + "\n")
-
-
-def match_any(path, regex_patterns):
-    """Tell if a given path match any of all regex patterns.
-
-    Arguments
-    ---------
-    path : `pathlib.Path`
-        Directory or file path to test again list of regexp patterns.
-    regex_patterns : `iterable` of `re.regex`
-        List of patterns to test :param:`path` against.
-
-    Returns
-    -------
-    `bool`
-        ``True`` if at least one pattern in :param:`regex_patterns`
-        *matches* :param:`path`; ``False`` otherwise (if none pattern
-        match path).
-    """
-    for pattern in regex_patterns:
-        match = pattern.match(str(path))
-        if match:
-            return True
-    return False
-
-match_none = lambda path, regex_patterns: not match_any(path, regex_patterns)
-
+# Files-related Functions  --------------------------------------------------
 
 def read_file_content(path):
     """Read a file content.
@@ -806,7 +1045,7 @@ def read_file_content(path):
 
     Returns
     -------
-    `FileContent`
+    :class:`Result`
         Always, reading content wins or errs.
     """
     content, error_msg = (None,) * 2
@@ -815,75 +1054,253 @@ def read_file_content(path):
         with open(path, mode='rb') as file_:
             content = file_.read()
     except OSError as error:
+        error_msg = \
+            f"Unable to open and read ``{path}`` file: {error.strerror}"
+
+    return Result(content, error_msg)
+
+
+def checksum(content, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
+    """Get a checksum hash hexadecimal digest from some content.
+
+    Arguments
+    ---------
+    content : `binary`
+        Some content from which compute checksum.
+    algorithm : `str`
+        Algorithm to use on node's content to generage checksum.
+
+    Returns
+    -------
+    `str`
+        Hexadecimal hash as checksum of :param:`content` through
+        :param:`algorithm` computation.
+    """
+    hash_ = (HASH_FUNCTIONS[algorithm])()
+    hash_.update(content)
+
+    return hash_.hexdigest()
+
+
+def write_new_line(filepath=None, encoding=None, content=None):
+    """Write new line with content at end of given file.
+
+    Arguments
+    ---------
+    filepath : `str`
+        Filepath into which append content; if set to ``None``, output
+        will be `sys.stdout`.
+    encoding : `str`
+        Encoding of :param:`file` if not `sys.stdout`.
+    content : `str`
+        Content to append as new line in :param:`file`.
+
+    Returns
+    -------
+    :class:`Result`
+        Container indicating if function call encountered some error.
+    """
+    if content is None:
+        return Result(True)
+    #else:
+
+    if filepath is None:
+        print(content)
+        return Result(True)
+    #else:
+
+    try:
+        with open(filepath, mode='at', encoding=encoding) as file_:
+            file_.write(content + "\n")
+    except OSError as error:
         error_msg = (
-            f"Unable to open and read ``{node_infos.path}`` file: "
+            f"Unable to write at end of `{filepath}`; got following error: "
             f"{error.strerror}")
+        LOGGER.critical(error_msg)
+        return Result(error_msg=error_msg)
 
-    return FileContent(content, error_msg)
+    return Result(True)
 
 
-def get_symlink_infos(path, dir_entry=None):
+# Nodes scanning Functions  -------------------------------------------------
+
+def get_symlink_infos(dir_entry):
     """Get some infos about a symbolic link.
 
     Arguments
     ---------
-    path : `pathlib.Path`
-        Path from which retrieve informations.
-    dir_entry : `os.DirEntry`
-        Item resulting of `os.scandir` on parent path, if any.
+    dir_entry : :class:`DirEntry`
+        Item resulting of `_scandir()` on parent path, if any.
 
     Returns
     -------
-    `PossibleSymLink`
+    :class:`Result` whose :attr:`value` could be a :class:`SymLink`
         :param:`path` links informations.
     """
     try:
-        linked_path = Path(readlink(path))
+        linked_path = Path(readlink(dir_entry.path))
     except PermissionError as error:
         error_msg = (
             f"Sym.Link ``{path}`` is unreadable, asking for its actual linked "
             f"path results in a permission error: {error.strerror}")
-        return PossibleSymLink(path, SymLinkType.error, None, error_msg)
+        return Result(error_msg=error_msg)
     except OSError as error:
         error_msg = (
             f"Sym.Link ``{path}`` is unreadable, asking for its actual linked "
             f"path results in a OSError: {error.strerror}")
-        return PossibleSymLink(path, SymLinkType.error, None, error_msg)
+        return Result(error_msg=error_msg)
 
+    # Make linked path absolute
     if not linked_path.is_absolute():
-        linked_path = Path(Path(path).parent / linked_path)
-    try:
-        linked_path = linked_path.resolve(strict=True)
-    except FileNotFoundError as error:
-        return PossibleSymLink(path, SymLinkType.broken, str(linked_path), None)
+        linked_path = dir_entry.path.parent / linked_path
 
+    # Try fully resolve linked path
+    linked_abspath = linked_path.resolve()
+    resolved_linked_path = None
     try:
-        if linked_path.is_dir():
-            return PossibleSymLink(path, SymLinkType.directory, str(linked_path),
-                                   None)
-        elif linked_path.is_file():
-            return PossibleSymLink(path, SymLinkType.file, str(linked_path),
-                                   None)
+        resolved_linked_path = linked_abspath.resolve(strict=True)
+    except FileNotFoundError as error:
+        return Result(SymLink(SymLinkType.broken, linked_abspath))
+    except RuntimeError as error:
+        return Result(SymLink(SymLinkType.circular, linked_abspath))
+
+    # Nominal cases:
+    error_msg = None
+    try:
+        if linked_abspath.is_symlink():
+            type_ = SymLinkType.symlink
+        elif linked_abspath.is_dir():
+            type_ = SymLinkType.directory
+        elif linked_abspath.is_file():
+            type_ = SymLinkType.file
         else:
-            error_msg = (
-                f"Linked path ``{linked_path}`` is neither a directory, a file "
-                f"nor a symlink!")
-            return PossibleSymLink(path, SymLinkType.error, str(linked_path),
-                                   error_msg)
+            type_ = SymLinkType.unkown
     except PermissionError as error:
         error_msg = (
-            f"Access to linked path ``{linked_path}`` is unreachable, trying "
-            f"to dertermine node's type results in a permission error: "
+            f"Access to linked path ``{linked_abspath}`` is unreachable, "
+            f"trying to dertermine node's type results in a permission error: "
             f"{error.strerror}")
-        return PossibleSymLink(path, SymLinkType.error, str(linked_path),
-                               error_msg)
     except OSError as error:
         error_msg = (
             f"Access to linked path ``{linked_path}`` is unreachable, trying "
             f"to dertermine node's type results in an OSerror: "
             f"{error.strerror}")
-        return PossibleSymLink(path, SymLinkType.error, str(linked_path),
-                               error_msg)
+
+    return Result(SymLink(type_, linked_abspath, resolved_linked_path))
+
+
+def get_node_infos(dir_entry):
+    """Get some file tree node informations.
+
+    Arguments
+    ---------
+    dir_entry : :class:`DirEntry`
+        Item resulting of `_scandir()` on parent path.
+
+    Returns
+    -------
+    NodeInfos
+        Informations about node located at :param:`path`.
+    """
+    symlink_value, symlink_type, resolved_symlink_path = (None,) * 3
+    error_msgs = []
+    path, type_ = dir_entry.path, dir_entry.type
+
+    # Ensure node already exists
+    _error_msg = (
+        f"Path ``{path}`` seems to either not exist (any more) or user who "
+        f"launch application has not enough rights to ask for more "
+        f"information about node!")
+    try:
+        if not dir_entry.is_path_existing():
+            error_msgs.append(_error_msg)
+    except PermissionError as error:
+        error_msgs.append(_error_msg)
+
+    # Sym.link
+    if dir_entry.is_symlink():
+        symlink_result = get_symlink_infos(dir_entry)
+        if symlink_result.has_error():
+            error_msgs.append(symlink_result.error_msg)
+        if symlink_result.has_value():
+            symlink = symlink_result.value
+            symlink_value, symlink_type, resolved_symlink_path = \
+                symlink.linked_path, symlink.type, symlink.resolved_linked_path
+
+            if symlink.is_broken():
+                error_msg = (
+                    f"Sym.link is broken: path to ``{symlink.linked_path}`` "
+                    f"seems unreachable!")
+                error_msgs.append(error_msg)
+            elif symlink.is_circular():
+                error_msg = (
+                    f"Sym.link could not be resolved, as "
+                    f"``{symlink.linked_path}`` is a start of circular "
+                    f"reference!")
+                error_msgs.append(error_msg)
+            elif symlink.is_linked_path_unknown():
+                error_msg = (
+                    f"Sym.link value of ``{symlink.linked_path}`` could not "
+                    f"be resolved to either a file, a directory or an other "
+                    f"sym.link!")
+                error_msgs.append(error_msg)
+
+    # `ls` shell command
+    ls_output, _ls_output, \
+    p_type, perms, links_nb, user_owner, \
+        group_owner, security, size = (None,) * 9
+    ls_cmd = LSD.format(path=path) if dir_entry.is_dir() \
+                                   else LS.format(path=path)
+
+    try:
+        completed_process = run(ls_cmd, shell=True, check=True, stdout=PIPE,
+                                stderr=STDOUT, encoding=ENCODING)
+        _ls_output = completed_process.stdout.rstrip()
+    except CalledProcessError as error:
+        error_msgs.append(f"Failed to run `ls` on ``{path}``: {error.stderr}")
+
+    if _ls_output:
+        match = LS_OUTPUT_REGEX.match(_ls_output)
+        if match is None:
+            ls_output = _ls_output
+            error_msg = \
+                f"Unable to parse output of `ls` command: ``{ls_output}``!"
+            error_msgs.append(error_msg)
+        else:
+            p_type, perms, links_nb, \
+                user_owner, group_owner, \
+                security, size = match.group('p_type', 'p_perms', 'links_nb',
+                                             'user_owner', 'group_owner',
+                                             'security', 'size')
+            # Conversions from string to specific types
+            links_nb = int(links_nb)
+            size = int(size)
+
+            # Check if types are coherents
+            if p_type != type_.as_ls_output_char():
+                error_msg = (
+                    f"Types differ from Python :mod:`os.scandir` result and "
+                    f"output of `ls` command: ``{type_}`` (Python) != "
+                    f"``{p_type}`` (ls)!")
+                error_msgs.append(error_msg)
+
+    # Get (a|m|c)time(s)
+    atime, mtime, ctime = (None,) * 3
+    try:
+        atime = getatime(path)
+        mtime = getmtime(path)
+        ctime = getctime(path)
+    except OSError as error:
+        error_msgs.append("Unable to retrieve either atime, mtime and/or ctime!")
+
+    return NodeInfos(path, type_,
+                     links_nb=links_nb, size=size,
+                     perms=perms, user_owner=user_owner, group_owner=group_owner,
+                     security=security,
+                     atime=atime, mtime=mtime, ctime=ctime,
+                     symlink_type=symlink_type, symlink_value=symlink_value,
+                     resolved_symlink_path=resolved_symlink_path,
+                     error_msgs=error_msgs, ls_output=ls_output)
 
 
 def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
@@ -903,187 +1320,39 @@ def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
 
     Returns
     -------
-    `str` or ``None``
+    :class:`Result` with value as `str`
         MD5 sum hash as hexadecimal digest if node is an actual file and
         reading its content was possible; ``None`` otherwise.
     """
-    if not node_infos.is_file():
-        error_msg = (
-            f"Node for which compute content's checksum must be of type file! "
-            f"Node passed as parameter, for path ``{node_infos.path}``, is of "
-            f"type `{node_infos.type}`.")
-        raise AssertionError(error_msg)
-
     if not node_infos.is_path_existing():
         error_msg = (
             f"Node's filepath ``{node_infos.path}`` does not point to a valid "
-            f"file anymore!")
-        node_infos.add_error_msg(error_msg)
-        return None
+            f"file anymore (detected when trying to compute its checksum)!")
+        return Result(error_msg=error_msg)
     # else:
 
-    file_content = read_file_content(node_infos.path)
-    if file_content.error_msg:
-        node_infos.add_error_msg(error_msg)
-        return None
+    file_content_result = read_file_content(node_infos.path)
+    if file_content_result.has_error():
+        return Result(error_msg=file_content_result.error_msg)
     # else:
 
-    hash_ = (HASH_FUNCTIONS[algorithm])()
-    hash_.update(file_content.content)
-
-    return hash_.hexdigest()
+    return Result(checksum(file_content_result.value, algorithm))
 
 
-def get_node_infos(path, dir_entry):
-    """Get some file tree node informations.
-
-    Arguments
-    ---------
-    path : `pathlib.Path`
-        Absolute path from which retrieve informations.
-    dir_entry : `os.DirEntry`
-        Item resulting of `os.scandir` on parent path.
-
-    Returns
-    -------
-    NodeInfos
-        Informations about node located at :param:`path`.
-    """
-    type_, symlinked_path, symlink_type = (None,) * 3
-    error_msgs = []
-
-    # type
-    try:
-        if dir_entry.is_file(follow_symlinks=False):
-            type_ = NodeType.file
-        elif dir_entry.is_dir(follow_symlinks=False):
-            type_ = NodeType.directory
-        elif dir_entry.is_symlink():
-            type_ = NodeType.symlink
-            possible_symlink = get_symlink_infos(path)
-            symlinked_path = possible_symlink.linked_path
-            symlink_type = possible_symlink.link_type
-            if possible_symlink.error_msg:
-                error_msgs.append(possible_symlink.error_msg)
-        else:
-            error_msg = \
-                f"Path ``{path}`` is neither a directory, a file or a symlink!"
-            return NodeInfos(path, NodeType.other,
-                             symlink=symlinked_path, symlink_type=symlink_type,
-                             error_msgs=error_msg)
-    except PermissionError as error:
-        error_msg = (
-            f"Path ``{path}`` is unreachable, asking for its type results in "
-            f"a permission error: {error.strerror}")
-        return NodeInfos(path, type_,
-                         symlink=symlinked_path, symlink_type=symlink_type,
-                         error_msgs=error_msg)
-    except OSError as error:
-        error_msg = (
-            f"Checking for ``{path}`` type results in an OSError: "
-            f"{error.strerror}")
-        return NodeInfos(path, type_,
-                         symlink=symlinked_path, symlink_type=symlink_type,
-                         error_msgs=error_msg)
-
-    # ls
-    try:
-        ls_cmd = LSD.format(path=path) if (type_ == NodeType.directory) \
-                                      else LS.format(path=path)
-        completed_process = run(ls_cmd, shell=True, check=True, stdout=PIPE,
-                                stderr=STDOUT, encoding=ENCODING)
-        output = completed_process.stdout.rstrip()
-    except CalledProcessError as error:
-        error_msgs.append(f"Failed to run `ls` on ``{path}``: {error.stderr}")
-        return NodeInfos(path, type_,
-                         symlink=symlinked_path, symlink_type=symlink_type,
-                         error_msgs=error_msgs)
-
-    match = LS_OUTPUT_REGEX.match(output)
-    if match is None:
-        error_msgs.append(f"Unable to parse output of `ls` command: ``{output}``")
-        return NodeInfos(path, type_,
-                         symlink=symlinked_path, symlink_type=symlink_type,
-                         error_msgs=error_msgs)
-    # else:
-
-    # retrieve property values from parsed regexp
-    p_type, perms, links_nb, \
-        user_owner, group_owner, \
-        security, size = match.group('p_type', 'p_perms', 'links_nb',
-                                     'user_owner', 'group_owner', 'security',
-                                     'size')
-    #   Conversions from string to specific types
-    links_nb = int(links_nb)
-    size = int(size)
-
-    # Check if types are coherents
-    if p_type != type_.as_ls_output_char():
-        error_msg = (
-            f"Types differ from Python :mod:`os.scandir` result and output of "
-            f"`ls` command: ``{type_}`` (Python) != ``{p_type}`` (ls)!")
-        error_msgs.append(error_msg)
-
-    # Get (a|m|c)time(s)
-    atime, mtime, ctime = (None,) * 3
-    try:
-        atime = getatime(path)
-        mtime = getmtime(path)
-        ctime = getctime(path)
-    except OSError as error:
-        error_msgs.append("Unable to retrieve either atime, mtime and/or ctime!")
-
-    return NodeInfos(path, type_,
-                     links_nb=links_nb, size=size,
-                     perms=perms, user_owner=user_owner, group_owner=group_owner,
-                     security=security,
-                     atime=atime, mtime=mtime, ctime=ctime,
-                     symlink=symlinked_path, symlink_type=symlink_type,
-                     error_msgs=error_msgs)
-
-
-def _scandir(dirpath):
-    """Scan a given directory and sort its entries by types and names.
-
-    Arguments
-    ---------
-    dirpath : `pathlib.Path`
-        Directory path to scan.
-
-    Returns
-    -------
-    :class:`DirEntries`
-        Directory entries, sorted by types and names.
-    """
-    _dirs, _files, _links = ([], [], [])
-    with scandir(dirpath) as dir_entries:
-        for dir_entry in dir_entries:
-            if dir_entry.is_symlink():
-                _links.append(dir_entry)
-            elif dir_entry.is_dir(follow_symlinks=False):
-                _dirs.append(dir_entry)
-            elif dir_entry.is_file(follow_symlinks=False):
-                _files.append(dir_entry)
-
-    _dirs = sorted(_dirs, key=lambda entry: entry.name)
-    _files = sorted(_files, key=lambda entry: entry.name)
-    _links = sorted(_links, key=lambda entry: entry.name)
-
-    return DirEntries(_dirs, _files, _links)
-
-
-def process(parent_dirpath, dir_entry, options):
+def process_dir_entry(dir_entry, options):
     """Process some node's path.
 
     Arguments
     ---------
-    parent_dirpath : `pathlib.Path`
-        Node's praent path.
-    dir_entry : `os.DirEntry`
-        Parent's directory entry corresponding to present node, as returned
-        by `os.scandir`.
+    dir_entry : :class:`DirEntry`
+        Directory entry to process.
     options : :class:`Options`
         Current application options.
+
+    Preconditions
+    -------------
+    dir_entry
+        ``not dir_entry.is_excluded()``
 
     Returns
     -------
@@ -1091,34 +1360,84 @@ def process(parent_dirpath, dir_entry, options):
         Node's metadata, or ``None`` if its path has to be excluded as set
         in :param:`options`.
     """
-    node_path = parent_dirpath / fsdecode(dir_entry.name)
-    if match_any(node_path, options.excluded_regex):
-        return None
-
-    node_infos = get_node_infos(node_path, dir_entry)
+    node_infos = get_node_infos(dir_entry)
 
     algorithm = options.checksum
     if algorithm and node_infos.is_file():
-        checksum = get_node_content_checksum(node_infos, algorithm)
-        if checksum:
-            node_infos.add_checksum(algorithm, checksum)
+        checksum_result = get_node_content_checksum(node_infos, algorithm)
+        if checksum_result.has_error():
+            node_infos.add_error_msg(checksum_result.error_msg)
+        else:
+            node_infos.add_checksum(algorithm, checksum_result.value)
 
     return node_infos
 
 
-def walk(dir_path, options):
-    """Walk a given directory path.
+def _scandir(dir_entry, options):
+    """Scan a given directory and sort its entries by types and names.
+
+    Arguments
+    ---------
+    dir_entry : :class:`DirEntry`
+        Directory entry corresponding to a directory to scan.
+    options : :class:`Options`
+        Current application options.
+
+    Returns
+    -------
+    :class:`DirEntries`
+        Directory entries, as :class:`DirEntry`, sorted by types and names.
+    """
+    dirs, files, links, excluded, unknowns = ([], [], [], [], [])
+    parent_dirpath = dir_entry.path
+
+    try:
+        with scandir(parent_dirpath) as dir_entries:
+            for dir_entry in dir_entries:
+                dir_entry = DirEntry(parent_dirpath, dir_entry, options)
+
+                if dir_entry.is_excluded():
+                    excluded.append(dir_entry)
+                elif dir_entry.is_symlink():
+                    links.append(dir_entry)
+                elif dir_entry.is_dir():
+                    dirs.append(dir_entry)
+                elif dir_entry.is_file():
+                    files.append(dir_entry)
+                elif dir_entry.is_type_unknown():
+                    unknowns.append(dir_entry)
+                else:
+                    dir_entry.set_type(NodeType.unknown)
+                    unknowns.append(dir_entry)
+    except OSError as error:
+        LOGGER.error((
+            f"Failed to run `os.scandir()` on ``{parent_dirpath}`` path! Get "
+            f"following error message: {error.strerror}"))
+        pass
+
+    dirs = sorted(dirs, key=lambda entry: entry.name)
+    files = sorted(files, key=lambda entry: entry.name)
+    links = sorted(links, key=lambda entry: entry.name)
+    # No need to sort excluded entries!
+    unknowns = sorted(unknowns, key=lambda entry: entry.name)
+
+    return DirEntries(dirs, files, links, excluded, unknowns)
+
+
+def walk(dir_entry, options):
+    """Walk a given directory.
 
     Entries in path are walked in this order:
 
-    #.  by their types first: files first, then symlinks, then directories;
+    #.  by their types first: directories first, then regular files,
+        then symlinks, then excluded entries and last unknown typed entries;
     #.  by their names then.
 
     Arguments
     ---------
-    dir_path : `pathlib.Path`
-        Directory path to walk.
-    optins : :class:`Options`
+    dir_entry : :class:`DirEntry`
+        Directory entry corresponding to a directory.
+    options : :class:`Options`
         Current application options.
 
     Yields
@@ -1127,60 +1446,54 @@ def walk(dir_path, options):
         List of output of shell command `ls` on walked paths as constructed
         `Node` instances.
     """
-    LOGGER.info((f"  Start scanning `{options.get_path(dir_path)}/` "
+    # Ensure current dir. path is not to be excluded before processing it
+    if dir_entry.is_excluded():
+        LOGGER.info((f"  Not scanning ``{options.get_path(dir_path)}/``: "
+                     f"directory path has to be excluded..."))
+        return []
+    # else:
+
+    LOGGER.info((f"  Start scanning ``{options.get_path(dir_entry.path)}/`` "
                  "directory..."))
 
-    _dir_entries = _scandir(dir_path)
-    dir_entries, file_entries, link_entries = \
-        _dir_entries.directories, _dir_entries.files, _dir_entries.links
+    _dir_entries = _scandir(dir_entry, options)
+    dir_entries, file_entries, link_entries, \
+    excluded_entries, unknown_entries = \
+        _dir_entries.directories, _dir_entries.files, _dir_entries.links, \
+        _dir_entries.excluded, _dir_entries.unknowns
 
-    # Scan files first, then symlinks
-    for node_entry in (file_entries + link_entries):
-        node = process(dir_path, node_entry, options)
-
-        if node:
-            yield node
-            sleep(options.get_random_sleep_time())
-
-    # Scan directories then
-    subdir_nodes = []
+    # Scan directories first
+    subdir_entries = []
     for dir_entry in dir_entries:
-        node = process(dir_path, dir_entry, options)
+        node = process_dir_entry(dir_entry, options)
+        subdir_entries.append(dir_entry)
+        yield node
+        sleep(options.get_random_sleep_time())
 
-        if node:
-            subdir_nodes.append(node)
-            yield node
-            sleep(options.get_random_sleep_time())
+    # Scan files second, then symlinks
+    for node_entry in (file_entries + link_entries):
+        yield process_dir_entry(node_entry, options)
+        sleep(options.get_random_sleep_time())
+
+    # Log and yield each of excluded entries
+    for dir_entry in excluded_entries:
+        LOGGER.info((f"  Not asking more infos about "
+                     f"``{options.get_path(dir_entry.path)}``: path has to be "
+                     f"excluded..."))
+        yield NodeInfos(dir_entry.path, dir_entry.type)
+
+    # Log and yield all unknown entries ?!
+    for dir_entry in unknown_entries:
+        LOGGER.warning((f"  Node at ``{options.get_path(dir_entry.path)}`` "
+                        f"path could create some problems: its type could not "
+                        f"be asked by `os.DirEntry.is_*()` methods, and so is "
+                        f"currently unkonw..."))
+        yield process_dir_entry(dir_entry, options)
+        sleep(options.get_random_sleep_time())
 
     # Last, recursively walk inside each subdirectory nodes
-    for subdir_node in subdir_nodes:
-        yield from walk(subdir_node.path, options)
-
-
-def process_only(node_path, options):
-    """Process some terminal node's path.
-
-    Arguments
-    ---------
-    node_path : `pathlib.Path`
-        Node's path to process.
-    options : :class:`Options`
-        Current application options.
-
-    Returns
-    -------
-    `NodeInfos` or ``None``
-        Node's metadata, or ``None`` if :param:`node_path` has to be excluded
-        as set in :param:`options`.
-    """
-    # Search for `os.DirEntry` corresponding to :param:`node_path`
-    parent_dirpath = node_path.parent
-    with scandir(parent_dirpath) as dir_entries:
-        for dir_entry in dir_entries:
-            if dir_entry.name == node_path.name:
-                node = process(parent_dirpath, dir_entry, options)
-                if node:
-                    return node
+    for subdir_entry in subdir_entries:
+        yield from walk(subdir_entry, options)
 
 
 # CLI  ----------------------------------------------------------------------
@@ -1214,7 +1527,7 @@ def create_args_parser():
                               "parts. Default to "
                               f"``{DEFAULT_MIN_TIME_SLEEP:.3f},"
                               f"{DEFAULT_MAX_TIME_SLEEP:.3f}``."
-                              "If you explicitely desires no sleep time, "
+                              "If you explicitely desire no sleep time, "
                               "option must be set to ``0,0``."))
     parser.add_argument('-o', '--output',
                         help=("Output CSV filepath where store results of "
@@ -1243,6 +1556,26 @@ def create_args_parser():
 
 
 # Main  ---------------------------------------------------------------------
+
+def exit_on_error(msg, return_code=1):
+    """Exit system on error.
+
+    .. note::
+
+        This function should only be used *before* application logging is
+        fully configured, i.e. only used by :func:`prepare_options`!
+        All other cases should see use of :func:`app_exit` instead.
+
+    Arguments
+    ---------
+    msg : `str`
+        Error message to print to `sys.stderr`.
+    return_code : `int`
+        Return code.
+    """
+    print(msg, file=stderr)
+    exit(return_code)
+
 
 def configure_logging(logfile_path=None, encoding=ENCODING,
                       level=DEFAULT_LOG_LEVEL):
@@ -1337,13 +1670,11 @@ def extend_excluded(excluded, script_path, excluded_relative_to,
     return excluded
 
 
-def prepare_options(app_run_infos, parsed_cli_args):
+def prepare_options(parsed_cli_args):
     """Prepare application global options object.
 
     Arguments
     ---------
-    app_run_infos : :class:`AppRunInfos`
-        Application's run informations.
     parsed_cli_args : `namespace`
         Parsed CLI arguments, as returned by
         `argparse.ArgumentParser.parse_args()`.
@@ -1357,6 +1688,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
     sleep_option = parsed_cli_args.sleep
     sleep_parts = sleep_option.split(',')
     if len(sleep_parts) != 2:
+        # FIXME: exit_on_error() ??
         exit_on_error((f"`--sleep` option must contain 2 parts separeted by a "
                        "comma (`,`); value passed here, ``{sleep_option}``, "
                        "contains {len(sleep_parts} parts separeted by a comma!"))
@@ -1377,7 +1709,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
         try:
             pathes_to_walk.append(Path(path).resolve(strict=True))
         except FileNotFoundError as error:
-            exit_on_error(f"Unable to reach ``{path}`` path to walk on it!")
+            exit_on_error(f"Unable to reach ``{path}`` path to scan!")
 
     # Nodes' pathes relative to
     pathes_relative_to = None
@@ -1443,7 +1775,7 @@ def prepare_options(app_run_infos, parsed_cli_args):
     #   Construct list of pathes to exclude
     excluded = [] if ("exclude" not in parsed_cli_args) \
                     else set(parsed_cli_args.exclude.split(','))
-    excluded = extend_excluded(excluded, script_path=app_run_infos.script_path,
+    excluded = extend_excluded(excluded, script_path=APP_RUN_INFOS.script_path,
                                excluded_relative_to=excluded_relative_to,
                                output_path=output_path,
                                logfile_path=logfile_path)
@@ -1457,21 +1789,19 @@ def prepare_options(app_run_infos, parsed_cli_args):
                    checksum=parsed_cli_args.checksum)
 
 
-def log_infos(app_run_infos, options):
+def log_infos(options):
     """Start logging application run options.
 
     Arguments
     ---------
-    app_run_infos : :class:`AppRunInfos`
-        Application's run informations.
     options : :class:`Options`
         Application options.
     """
     LOGGER.info("Application run informations:")
-    LOGGER.info(f"- current Python script path: {app_run_infos.script_path}")
-    LOGGER.info(f"- current working directory: {app_run_infos.working_dirpath}")
-    LOGGER.info(f"- process id (pid): {app_run_infos.pid}")
-    LOGGER.info(f"- start date/time: {app_run_infos.start_datetime_as_isoformat}")
+    LOGGER.info(f"- current Python script path: {APP_RUN_INFOS.script_path}")
+    LOGGER.info(f"- current working directory: {APP_RUN_INFOS.working_dirpath}")
+    LOGGER.info(f"- process id (pid): {APP_RUN_INFOS.pid}")
+    LOGGER.info(f"- start date/time: {APP_RUN_INFOS.start_datetime_as_isoformat}")
     LOGGER.info("Will scan following pathes:")
     for path in options.walked_pathes:
         LOGGER.info(f"- `{path}`")
@@ -1494,14 +1824,27 @@ def log_infos(app_run_infos, options):
             LOGGER.info(f'  - ``"{excluded_pattern}"``')
 
 
+def app_exit(return_code=0):
+    """Exit current application run.
+    """
+    now = datetime.now()
+    timedelta = now - APP_RUN_INFOS.start_datetime
+
+    LOGGER.critical(f"Process terminating at {now.isoformat(' ')}!")
+    LOGGER.info((
+        f"Script has run {timedelta} from "
+        f"{APP_RUN_INFOS.start_datetime_as_isoformat}!"))
+
+    exit(return_code)
+
+
 def stop_signal_handler(signal=None, frame=None):
     """Handler for all signals terminating current application run.
     """
-    now = datetime.now().isoformat()
-    LOGGER.critical((f"Process terminating, receiving ``{signal}`` (i.e. "
+    LOGGER.critical((f"Process receiving ``{signal}`` (i.e. "
                      f"``{SIGNALS[signal]}``) signal (or keyboard Ctrl+C "
-                     f"interrupt) at {now}!"))
-    exit(2)
+                     f"interrupt)!"))
+    app_exit(2)
 
 
 def _main(options):
@@ -1512,7 +1855,10 @@ def _main(options):
         signal(_signal, stop_signal_handler)
 
     # Walk tree and print dir. entries metadata:
-    write_new_line(options.output_path, ENCODING, NodeInfos.colstocsv())
+    write_result = write_new_line(options.output_path, ENCODING,
+                                  NodeInfos.colstocsv())
+    if write_result.has_error():
+        app_exit(1)
 
     #   Process node(s)
     pathes_relative_to = options.pathes_relative_to
@@ -1520,17 +1866,34 @@ def _main(options):
 
     try:
         for path in options.walked_pathes:
-            # Case of terminal node (e.g. file):
-            if not path.is_dir():
-                node_infos = process_only(path, options)
-                if node_infos:
-                    write_new_line(output_path, ENCODING,
-                                   node_infos.tocsv(pathes_relative_to))
-            else:
+            try:
+                dir_entry = DirEntry.new_entry_from_path(path, options)
+            except FileNotFoundError as error:
+                LOGGER.error(error.strerror)
+                continue
+            # else:
+
+            if dir_entry.is_excluded():
+                error_msg = (
+                    f"  Not scanning ``{options.get_path(dir_entry.path)}``: "
+                    f"node's path has to be excluded...")
+                LOGGER.info(error_msg)
+                continue
+            # else:
+
+            if not dir_entry.is_dir():
+                node_infos = process_dir_entry(dir_entry, options)
+                write_result = write_new_line(output_path, ENCODING,
+                                              node_infos.tocsv(pathes_relative_to))
+                if write_result.has_error():
+                    app_exit(1)
+            else:  # dir_entry.is_dir()
                 # Nominal case of a directory:
-                for node_infos in walk(path, options):
-                    write_new_line(output_path, ENCODING,
-                                   node_infos.tocsv(pathes_relative_to))
+                for node_infos in walk(dir_entry, options):
+                    write_result = write_new_line(output_path, ENCODING,
+                                                  node_infos.tocsv(pathes_relative_to))
+                    if write_result.has_error():
+                        app_exit(1)
 
             sleep(options.get_random_sleep_time())
     except KeyboardInterrupt as error:
@@ -1540,17 +1903,18 @@ def _main(options):
 def main():
     """Main function, software entrypoint.
     """
-    app_run_infos = AppRunInfos()
+    global APP_RUN_INFOS
+    APP_RUN_INFOS = AppRunInfos()
 
     args_parser = create_args_parser()
     parsed_cli_args = args_parser.parse_args()
 
     # Continue application configuration
-    options = prepare_options(app_run_infos, parsed_cli_args)
+    options = prepare_options(parsed_cli_args)
     configure_logging(options.logfile_path)
 
     # Start logging
-    log_infos(app_run_infos, options)
+    log_infos(options)
 
     # Walk tree and print dir. entries metadata:
     LOGGER.info(f"Start scanning...")
@@ -1558,10 +1922,10 @@ def main():
     _main(options)
 
     # End of run!
-    LOGGER.info(f"Stop scanning: job finished!")
-    return 0
+    LOGGER.critical("Stop scanning: job finished normally!")
+    app_exit(0)
 
 
 if __name__ == '__main__':
-    exit(main())
+    main()
 
