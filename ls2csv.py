@@ -34,6 +34,7 @@ from os.path import (
     isfile,
     islink,
     join,
+    lexists,
 )
 from pathlib import Path
 from random import uniform
@@ -296,9 +297,21 @@ class NodeInfos:
             _path = self._path
         return str(_path)
 
+    def is_path_existing(self):
+        return lexists(self._path)
+
     @property
     def type(self):
         return self._type
+
+    def is_dir(self):
+        return self._type == NodeType.directory
+
+    def is_file(self):
+        return self._type == NodeType.file
+
+    def is_symlink(self):
+        return self._type == NodeType.symlink
 
     @property
     def links_nb(self):
@@ -783,6 +796,9 @@ match_none = lambda path, regex_patterns: not match_any(path, regex_patterns)
 def read_file_content(path):
     """Read a file content.
 
+    If an error is encountered during file opening or content reading,
+    `OSError` is catched and not propagated.
+
     Arguments
     ---------
     path : `str`
@@ -871,7 +887,7 @@ def get_symlink_infos(path, dir_entry=None):
 
 
 def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
-    """Get a MD5 hash hexadecimal digest from content of a node.
+    """Get a checksum hash hexadecimal digest from content of a node.
 
     Arguments
     ---------
@@ -880,14 +896,29 @@ def get_node_content_checksum(node_infos, algorithm=DEFAULT_CHECKSUM_ALGORITHM):
     algorithm : `str`
         Algorithm to use on node's content to generage checksum.
 
+    Preconditions
+    -------------
+    node_infos
+        Node must be of type 'file'.
+
     Returns
     -------
     `str` or ``None``
         MD5 sum hash as hexadecimal digest if node is an actual file and
         reading its content was possible; ``None`` otherwise.
     """
-    type_ = node_infos.type
-    if type_ != NodeType.file:  # FIXME: also: "or not .exists()"
+    if not node_infos.is_file():
+        error_msg = (
+            f"Node for which compute content's checksum must be of type file! "
+            f"Node passed as parameter, for path ``{node_infos.path}``, is of "
+            f"type `{node_infos.type}`.")
+        raise AssertionError(error_msg)
+
+    if not node_infos.is_path_existing():
+        error_msg = (
+            f"Node's filepath ``{node_infos.path}`` does not point to a valid "
+            f"file anymore!")
+        node_infos.add_error_msg(error_msg)
         return None
     # else:
 
@@ -1066,10 +1097,11 @@ def process(parent_dirpath, dir_entry, options):
 
     node_infos = get_node_infos(node_path, dir_entry)
 
-    if options.checksum:
-        algorithm = options.checksum
-        node_infos.add_checksum(algorithm,
-                                get_node_content_checksum(node_infos, algorithm))
+    algorithm = options.checksum
+    if algorithm and node_infos.is_file():
+        checksum = get_node_content_checksum(node_infos, algorithm)
+        if checksum:
+            node_infos.add_checksum(algorithm, checksum)
 
     return node_infos
 
