@@ -1,0 +1,11 @@
+ToDo (?)
+========
+
+*   Give errors an immutable ID,
+    then print their ids before their messages,
+    then add n new columns in CSV (optionable?) resuming all errors ids
+    and for each node if it falls into any of them.
+*   Minimal README, and what to expect.
+*   Tests! Unit tests! Functional tests!
+*   Python3.x async/await.
+
