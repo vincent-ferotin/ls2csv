@@ -797,7 +797,7 @@ class NodeInfos:
             "atime (last access, in s. since Epoch)",
             "atime (ISO 8601 format)",
             "mtime (last mod., in s. since Epoch)",
-            "atime (ISO 8601 format)",
+            "mtime (ISO 8601 format)",
             "ctime (last metada change, in s. since Epoch)",
             "ctime (ISO 8601 format)",
             "Sym.link value",
