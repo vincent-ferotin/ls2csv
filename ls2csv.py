@@ -1487,7 +1487,7 @@ def walk(dir_entry, options):
         LOGGER.warning((f"  Node at ``{options.get_path(dir_entry.path)}`` "
                         f"path could create some problems: its type could not "
                         f"be asked by `os.DirEntry.is_*()` methods, and so is "
-                        f"currently unkonw..."))
+                        f"currently unknown..."))
         yield process_dir_entry(dir_entry, options)
         sleep(options.get_random_sleep_time())
 
@@ -1821,7 +1821,7 @@ def log_infos(options):
     else:
         LOGGER.info(f"- excluded path patterns are:")
         for excluded_pattern in excluded_patterns:
-            LOGGER.info(f'  - ``"{excluded_pattern}"``')
+            LOGGER.info(f'  - ``{excluded_pattern}``')
 
 
 def app_exit(return_code=0):
