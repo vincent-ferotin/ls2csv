@@ -8,4 +8,11 @@ ToDo (?)
 *   Tests! Unit tests! Functional tests!
 *   Python3.x async/await.
 *   Timestamp(s) of node's analysis
+*   Set node' type even if not dir/file/symlink but `ls` output was well
+    parsed: "r|M|n|p|s|c|b|D|?"
+    and change NodeType values for strings.
+
+    *   Only log if node's type is still unknonw.
+
+*   Allow excluding relative path, e.g. ``.git``, ``cache/``, etc.
 
